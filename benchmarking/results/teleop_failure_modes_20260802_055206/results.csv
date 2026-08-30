@@ -1,0 +1,31 @@
+status,collided,min_clear,mean_dsteer,mean_dthrottle,max_abs_y,steer_reversals,progress_x,final_v,scenario,title,cite,filter
+ok,0,-0.056895,0.0029043615819209045,0.05995035028248587,0.026624,29,96.053507,5.60678,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,none
+ok,0,0.176229,0.09803273446327684,0.1494738813559322,0.479433,20,81.863335,6.252526,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,0.331404,0.24421509604519775,0.11491423728813562,6.729789,14,77.480642,5.620185,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,mpsf
+ok,1,-1.865229,0.0013939130434782608,0.04733902173913044,0.039898,11,72.612993,5.931812,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,none
+ok,0,0.459226,0.22829005797101448,0.11013989130434783,2.925358,11,64.231544,5.980452,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,dob_cbf
+ok,0,1.461606,0.137491384057971,0.0879465652173913,3.662449,5,70.499357,5.511775,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,mpsf
+ok,1,-1.944809,0.0,0.025678036231884055,0.049328,13,73.645403,5.917773,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,none
+ok,0,2.122288,1.0798964347826088,0.740571652173913,1.211646,16,15.822548,0.003772,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,dob_cbf
+ok,0,1.547674,0.13877072463768114,0.06011477536231884,3.901289,5,71.952526,5.902126,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,mpsf
+ok,1,-0.804939,0.0039017681159420293,0.06780128985507247,0.542792,13,64.33513,5.656802,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,none
+ok,0,0.371298,0.07482613768115942,0.08188829710144926,1.409124,7,72.15399,5.432476,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,dob_cbf
+ok,0,1.383296,0.10399931884057971,0.08439502898550724,2.451244,7,71.314554,6.040786,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,mpsf
+ok,1,-1.449638,0.0,0.004347826086956522,21.231322,0,72.757245,9.042494,5_connection_freeze,Connection loss / frozen command,Brettin 2025,none
+ok,0,1.057782,0.03554683333333333,0.053460434782608694,23.517949,4,78.328626,6.31084,5_connection_freeze,Connection loss / frozen command,Brettin 2025,dob_cbf
+ok,0,1.403335,0.03380963768115942,0.010949333333333335,28.999009,2,90.583329,9.065574,5_connection_freeze,Connection loss / frozen command,Brettin 2025,mpsf
+ok,1,-2.066688,0.0007968188405797101,0.01233653623188406,0.057999,12,94.651312,8.896035,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,none
+ok,0,1.195155,0.7935942753623187,0.6937971014492753,0.311374,21,22.60426,0.009737,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,dob_cbf
+ok,0,0.758481,0.23640488405797103,0.07917580434782609,5.524719,5,82.575518,8.906431,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,mpsf
+ok,1,0.445205,0.0023611464968152866,0.03310962420382165,0.049781,17,52.021495,4.896278,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,none
+ok,0,5.239373,0.26898899363057327,1.0,0.018325,13,0.0516,-0.001152,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,1.430981,0.19551225477707007,0.26070991719745223,5.243441,6,68.569253,5.551478,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,mpsf
+ok,1,-1.486359,0.009838751592356691,0.06144141401273886,0.927167,9,80.601282,5.626027,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,none
+ok,0,5.900941,0.6193416751592357,1.0,0.015795,1,0.048346,0.012407,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,dob_cbf
+ok,0,1.695733,0.5755813630573249,0.13168832484076434,5.130526,6,66.934408,6.192649,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,mpsf
+ok,1,-2.839971,0.0,0.004127388535031846,0.44088,0,19.853951,0.324616,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,none
+ok,0,12.236504,0.6801721082802549,0.6,0.02005,2,0.054699,0.001595,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,dob_cbf
+ok,0,2.692649,0.005636936305732484,0.3922892101910828,0.425724,5,9.611509,-0.040336,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,mpsf
+ok,0,-0.20393,0.004125057324840764,0.057020611464968146,0.028399,26,84.082669,5.594439,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,none
+ok,0,0.602188,0.30867617834394906,0.1584805668789809,1.383672,20,66.274129,5.362358,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,0.926596,0.15230598089171973,0.10346972611464968,3.40958,17,77.000291,5.619227,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,mpsf

@@ -1,0 +1,62 @@
+key,value
+created_at,2026-08-27T22:59:59
+project_root,/home/ksha/Documents/sbel/offroad-control
+description,"Closed-loop tracking against the source of the controller's soil parameters, at a fixed speed reference."
+command,/home/ksha/Documents/sbel/offroad-control/benchmarking/tire_model_with_estimator_ablation.py --variants nn_static nn_estimator nn_parent_estimator nn_fixed_fallback --terrains clay dirt sand --paths sinusoidal lane_change right_left --speeds 5 7 9 --bumpiness 0 --seeds 5 --time 20 --metric-start 8 --estimator-backend grit --base-port 25000 --workers 8 --timeout 500.0
+env.HIL_SIM_EXTRA,--simple-powertrain --ff-drag-surrogate --dob-ki 0 --dob-max 0
+env.ACADOS_MPC_BUILD_ROOT,<unset>
+base_port,25000
+base_seed,400
+bumpiness,[0]
+conditioning_arms,"{'nn_static': 'matched-terrain oracle-information baseline', 'nn_estimator': 'promoted independent-n-phi online estimator', 'nn_parent_estimator': 'historical matched scalar-parent online estimator', 'nn_fixed_fallback': 'fixed promoted low-grip fallback endpoint'}"
+design_version,'conditioning_joint_parent_fallback_ros_isolated'
+estimator_backend,'grit'
+estimator_contract,"{'contract_version': 'independent_n_phi_joint_profile', 'accepted_snapshot_version': 'grit_accepted', 'promotion_status': 'active_paper_backend', 'backend': 'grit', 'controller_rate_model': 'tire_force_static', 'force_model_dir': 'nn_models/tire_force_rate', 'initial_prior': 'dirt', 'controller_min_confidence': 0.2, 'publication_max_evidence_age_s': 3.5, 'publication_min_observability_rank': 2, 'publication_min_observability_singular_value': 0.1, 'publication_boundary_mass_limit': 0.25, 'fallback_n': 0.5, 'fallback_phi_deg': 13.0, 'control_min_phi_deg': 10.0, 'fallback_policy': 'fixed_control_feasible_low_grip_endpoint', 'output_names': ['n', 'phi'], 'requires_ground_datum': False, 'truth_inputs': 'none', 'n_grid_size': 41, 'n_bounds': [0.4, 1.1], 'manifold_soft_floor': 0.4, 'manifold_soft_mode': 'hold', 'phi_grid_size': 17, 'phi_bounds_deg': [6.0, 37.8], 'cohesion_multiplier_bounds': [0.7, 1.3], 'cohesion_grid_size': 1, 'cohesion_prior_std': 0.2, 'student_dof': 4.0, 'smoothing_alpha': 1.0, 'update_interval': 1, 'block_dt_s': 0.5, 'history_horizon_s': 8.0, 'min_concurrent_windows': 8, 'min_window_samples': 4, 'r_ax_mps2': 0.35, 'r_ay_mps2': 0.45, 'min_information': 0.2, 'min_joint_information': 0.2, 'min_n_information': 0.0, 'min_phi_information': 0.0, 'min_yaw_rate_rms_radps': 0.015, 'min_speed_mps': 2.5, 'max_abs_slip_angle_rad': 0.35, 'enforce_rig_feature_envelope': True, 'slip_mode': 'average', 'fixed_kappa': 0.05, 'rate_mode': 'zero', 'block_alpha_rate': False, 'load_transfer_mode': 'static', 'force_gain_prior_std': 0.04, 'ax_bias_prior_std_mps2': 0.1, 'ay_bias_prior_std_mps2': 0.05, 'force_gain_bounds': [0.7, 1.3], 'acceleration_bias_bound_mps2': 0.3, 'profile_iterations': 8, 'min_observability_rank': 2, 'min_observability_singular_value': 0.1, 'boundary_warning_mass': 0.25, 'posterior_summary': 'mean', 'max_final_update_age_s': 3.5}"
+estimator_initial_prior,'dirt'
+fixed_fallback_contract,"{'controller_prior_terrain': 'clay', 'n': 0.5, 'phi_deg': 13.0, 'policy': 'fixed_control_feasible_low_grip_endpoint'}"
+historical_parent_estimator_backend,'scalar_parent'
+historical_parent_estimator_contract,"{'contract_version': 'matched_parent_profile_live', 'backend': 'scalar_parent', 'controller_rate_model': 'tire_force_static', 'force_model_dir': 'nn_models/tire_force_static_parent', 'initial_prior': 'dirt', 'controller_min_confidence': 0.0, 'n_grid_size': 41, 'student_dof': 4.0, 'update_interval': 1, 'block_dt_s': 0.5, 'history_horizon_s': 8.0, 'min_concurrent_windows': 12, 'min_window_samples': 4, 'r_ax_mps2': 0.35, 'r_ay_mps2': 0.3, 'min_information': 0.2, 'min_yaw_rate_rms_radps': 0.015, 'min_speed_mps': 2.5, 'max_abs_slip_angle_rad': 0.35, 'enforce_rig_feature_envelope': True, 'slip_mode': 'average', 'fixed_kappa': 0.05, 'slip_angle_rate_mode': 'zero', 'force_gain_prior_std': 0.04, 'ax_bias_prior_std_mps2': 0.1, 'ay_bias_prior_std_mps2': 0.05, 'force_gain_bounds': [0.7, 1.3], 'acceleration_bias_bound_mps2': 0.3, 'profile_iterations': 8}"
+historical_parent_force_checkpoint_sha256,'0e6382a54a0af823d5570cbe8648c26fef0fdfe9bb6fd61b1db508bbff4d712b'
+historical_parent_force_scalers_sha256,'8478cf87e141a207d216916ade62ac6f23992942b2cf00708b48d85cc25a739e'
+historical_parent_rate_checkpoint_sha256,'e353cd6363633d785e9bc6b8ca02a73b39b5dbc92d950fb23443ab78224cc15c'
+historical_parent_rate_scalers_sha256,'7e1796e3377670cf82e7d52349d2d74bf99b126e1a3794bc118f3d1f118f1e40'
+lateral_acceleration_bound_friction_angle_deg,13.0
+lateral_acceleration_bound_policy,'shared_worst_case_phi13_bound_v1'
+launch_identity_contract,'path_speed_seed_ports_domain'
+lead_in,5.0
+metric_start,8.0
+paths,"['sinusoidal', 'lane_change', 'right_left']"
+quick,False
+rate_checkpoint_sha256,'e353cd6363633d785e9bc6b8ca02a73b39b5dbc92d950fb23443ab78224cc15c'
+rate_scalers_sha256,'7e1796e3377670cf82e7d52349d2d74bf99b126e1a3794bc118f3d1f118f1e40'
+reference_policy,'shared_worst_case_phi13_curvature_v1'
+reference_profile_friction_angle_deg,13.0
+resume_dir,''
+ros_concurrency_policy,'exclusive_process_lease_and_batched_workers'
+seeds,5
+source_sha256,"{'benchmarking/paper_provenance.py': '3c31e339f2a29619c51101cfc943688fa17d36e3d7d08bc904f367d1b6bbcc5b', 'benchmarking/common.py': 'c187efd8d7a5b09e4ce181f99599e9f9510b5ba9c7eb8a2bd1a56df7f8b7f748', 'benchmarking/active_estimator_diagnostics.py': '2f9fffc36141b57613a64bcb38c7da5b82d7490535081e2fa0158f665d22ca6f', 'benchmarking/tire_model_with_estimator_ablation.py': '8e1cde20f5b4e4ae5b9a56a0860ab19f66bd1c98e499b264437576e9a57bc71e', 'simulation/control/acados_mpc_controller_node.py': 'aae952207e513595c8cecdf16faa25141930ff2eaf182c4eb2ed8fa082ce3b18', 'simulation/runtime/launch_decoupled.py': '69061c062c3385a96e2a04c57b56869613330a1ea8f09dcfe3acc1488f76b13a', 'simulation/runtime/chrono_sim_node.py': '24288be0d12cc52acdcaf0fc9b716dfe7f53804791077c89a8d477479d2e577e', 'simulation/estimators/scalar_parent_terrain_estimator.py': '25de5ca3481ecfeed93d998f31ce9064913af4babd17bdb6ab22b82ecacb6381', 'simulation/estimators/grit_terrain_estimator.py': '03fa749ac20398dc0f1718ead0acd9ee068e04a0fb17a36ca832331c99909999', 'simulation/estimators/terrain_parameterization.py': '7e4355024401c037c2b0b50577d7a17d864cee3b7769ddb087169f4b715314eb', 'simulation/shared/param_consistency.py': '1249f8cdf4f548e9a062934ce720ad8d1e5f479e073e6ebc788cfc91d67fa70a', 'simulation/tire_models/four_wheel_projection.py': '9931803e57dfffcab6fae3de26bebd6a306bc6b0208a6d753a714e167bb8c8a6', 'simulation/tire_models/nn_tire_model.py': '2a43bc6996492ca829fa5c5dd0ea37c632423fd6fde2794abd5e2213a3b0f0c9', 'simulation/tire_models/tire_input_features.py': '6fe34b46730f0c8c100a5a52e41972f29ced6233ae30005d5bf802d9705ace36'}"
+speeds,"[5.0, 7.0, 9.0]"
+terrains,"['clay', 'dirt', 'sand']"
+time,20.0
+timeout,500.0
+tire_force_truth_enabled,False
+variants,"['nn_static', 'nn_estimator', 'nn_parent_estimator', 'nn_fixed_fallback']"
+workers,8
+code_git_head,'cceb1940759bb36543fe04220ebbcabb826ffeec'
+tracked_worktree_dirty,False
+uncommitted_source_files,[]
+paper_evidence_eligible,True
+source_sha256.benchmarking/active_estimator_diagnostics.py,2f9fffc36141b57613a64bcb38c7da5b82d7490535081e2fa0158f665d22ca6f
+source_sha256.benchmarking/common.py,c187efd8d7a5b09e4ce181f99599e9f9510b5ba9c7eb8a2bd1a56df7f8b7f748
+source_sha256.benchmarking/paper_provenance.py,3c31e339f2a29619c51101cfc943688fa17d36e3d7d08bc904f367d1b6bbcc5b
+source_sha256.benchmarking/tire_model_with_estimator_ablation.py,8e1cde20f5b4e4ae5b9a56a0860ab19f66bd1c98e499b264437576e9a57bc71e
+source_sha256.simulation/control/acados_mpc_controller_node.py,aae952207e513595c8cecdf16faa25141930ff2eaf182c4eb2ed8fa082ce3b18
+source_sha256.simulation/estimators/grit_terrain_estimator.py,03fa749ac20398dc0f1718ead0acd9ee068e04a0fb17a36ca832331c99909999
+source_sha256.simulation/estimators/scalar_parent_terrain_estimator.py,25de5ca3481ecfeed93d998f31ce9064913af4babd17bdb6ab22b82ecacb6381
+source_sha256.simulation/estimators/terrain_parameterization.py,7e4355024401c037c2b0b50577d7a17d864cee3b7769ddb087169f4b715314eb
+source_sha256.simulation/runtime/chrono_sim_node.py,24288be0d12cc52acdcaf0fc9b716dfe7f53804791077c89a8d477479d2e577e
+source_sha256.simulation/runtime/launch_decoupled.py,69061c062c3385a96e2a04c57b56869613330a1ea8f09dcfe3acc1488f76b13a
+source_sha256.simulation/shared/param_consistency.py,1249f8cdf4f548e9a062934ce720ad8d1e5f479e073e6ebc788cfc91d67fa70a
+source_sha256.simulation/tire_models/four_wheel_projection.py,9931803e57dfffcab6fae3de26bebd6a306bc6b0208a6d753a714e167bb8c8a6
+source_sha256.simulation/tire_models/nn_tire_model.py,2a43bc6996492ca829fa5c5dd0ea37c632423fd6fde2794abd5e2213a3b0f0c9
+source_sha256.simulation/tire_models/tire_input_features.py,6fe34b46730f0c8c100a5a52e41972f29ced6233ae30005d5bf802d9705ace36

@@ -1,0 +1,19 @@
+{
+  "max_abs_prediction_difference": 0.0,
+  "metadata_injected": {
+    "checkpoint_format": "tire_force_static_mlp",
+    "seed": 42,
+    "training_csv_sha256": "926938c0f44e6c3914a4e1e99f05d304ca710a8690188ada1c014aa7fad5923c",
+    "training_source": "chrono_scm_single_tire_rig"
+  },
+  "prediction_probe_rows": 4,
+  "prediction_probe_sha256": "80057158ee1302a3f3f4ba5f98d2ad1193ef5187c8c9a5321c591456209333f1",
+  "repack_contract": "tire_force_metadata_repack",
+  "repacked_checkpoint_sha256": "0e6382a54a0af823d5570cbe8648c26fef0fdfe9bb6fd61b1db508bbff4d712b",
+  "scaler_file_unchanged": true,
+  "scalers_sha256": "8478cf87e141a207d216916ade62ac6f23992942b2cf00708b48d85cc25a739e",
+  "source_checkpoint_sha256": "6957c7eb98fefd9b329a57bd6b6d279f58b8706db7e06beba47fb4dc5d5ab505",
+  "state_dict_sha256": "4092c993ef53590600af8649821839a6c04a4c3319ef1826cc7c09b23f9859fa",
+  "tensor_values_identical": true,
+  "training_csv_verified": true
+}

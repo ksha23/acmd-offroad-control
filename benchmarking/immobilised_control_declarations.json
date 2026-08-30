@@ -1,0 +1,46 @@
+{
+  "_README": [
+    "Cells where a filtered arm is expected to barely move, declared in advance so",
+    "the immobilised_prevention gate can tell a deliberate stationary control from",
+    "a prevention claim that quietly rests on the vehicle never setting off.",
+    "",
+    "A declaration is not an excuse. It asserts that the immobilisation is the",
+    "point of the cell and that no prevention count in the manuscript pools it in.",
+    "Anything not listed here still fails the build, which is what caught the",
+    "2026-07-28 convoy study in the first place.",
+    "",
+    "Keys are result directory names. Each entry lists the scenarios exempted for",
+    "that source, with the reason and where the reason is written down."
+  ],
+  "latency_awareness_ablation_20260730_202438": {
+    "scenarios": [
+      "lead_brake"
+    ],
+    "reason": [
+      "Preregistered stationary negative control. DOB-CBF's delay term is",
+      "d_delay = v * min(2*tau, 0.6), proportional to speed, so it vanishes at",
+      "rest. lead_brake is included precisely because the ego halts there: it is",
+      "the cell where the mechanism under test must show no effect, and it does",
+      "(paired delta +0.003 m, p = 0.0625). Excluding it from the primary",
+      "endpoint was fixed before the contrast was observed."
+    ],
+    "declared_in": "docs/LATENCY_AWARENESS_ABLATION_V2_PREREGISTRATION.md",
+    "pooled_into_a_prevention_count": false
+  },
+  "latency_awareness_ablation_20260801_062931": {
+    "scenarios": [
+      "lead_brake"
+    ],
+    "reason": [
+      "Same preregistered stationary negative control as the 2026-07-30",
+      "generation: DOB-CBF's delay term d_delay = v * min(2*tau, 0.6)",
+      "vanishes at rest, so lead_brake is the cell where the mechanism under",
+      "test must show no effect. The 2026-08-01 regeneration under contract",
+      "v4 and the static controller surrogate reproduces the identical",
+      "stationary outcome (median progress 0.1 m in both filtered arms).",
+      "Excluded from every prevention count in the manuscript."
+    ],
+    "declared_in": "docs/LATENCY_AWARENESS_ABLATION_V2_PREREGISTRATION.md",
+    "pooled_into_a_prevention_count": false
+  }
+}

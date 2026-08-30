@@ -1,0 +1,43 @@
+{
+  "preregistration_sha256": "6bfdd3387d44ea8e34fc65dd39bdd0fad9fc751936771adb44ffe6f3a080f4c1",
+  "truth_sha256": "9e379162c52ce18405c192fe0a82aada054b4ca3f106b51792f9a3401a9768b2",
+  "trace_count": 144,
+  "never_accepting_cells": [
+    "trace_0014",
+    "trace_0108",
+    "trace_0117"
+  ],
+  "endpoints": {
+    "1_soft_signed": {
+      "value": 0.04555088748238369,
+      "cap": 0.08,
+      "pass": true
+    },
+    "2_n_mae": {
+      "value": 0.10078028283160394,
+      "cap": 0.134,
+      "pass": true
+    },
+    "3_phi_mae_deg": {
+      "value": 1.7898197588382914,
+      "cap": 2.23,
+      "pass": true
+    },
+    "4_n_spearman": {
+      "value": 0.8864877682242167,
+      "floor": 0.8,
+      "pass": true
+    },
+    "5_publish_rate": {
+      "value": 0.9791666666666666,
+      "minimum": 0.9,
+      "pass": true
+    },
+    "6_validity": {
+      "soft_trace_count": 31,
+      "minimum": 25,
+      "pass": true
+    }
+  },
+  "accept": true
+}

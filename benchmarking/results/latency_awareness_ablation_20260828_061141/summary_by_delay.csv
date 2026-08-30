@@ -1,0 +1,7 @@
+variant,delay_s,n,collisions,mean_clearance_m,dsteer,collision_rate
+dob_aware,0.15,15,3,3.372,0.15,0.2
+dob_aware,0.3,15,3,7.277,0.181,0.2
+dob_blind,0.15,15,3,3.335,0.193,0.2
+dob_blind,0.3,15,3,6.628,0.162,0.2
+none,0.15,15,12,-0.832,,0.8
+none,0.3,15,11,4.217,,0.733

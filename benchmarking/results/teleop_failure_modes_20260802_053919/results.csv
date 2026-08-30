@@ -1,0 +1,41 @@
+status,collided,min_clear,mean_dsteer,mean_dthrottle,max_abs_y,steer_reversals,progress_x,final_v,scenario,title,cite,filter
+ok,0,-0.027604,0.002774107344632768,0.06025920338983051,0.01468,29,96.081119,5.607229,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,none
+ok,0,0.149213,0.11437657062146893,0.1455104745762712,0.402688,17,82.452766,5.904077,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,0.577341,0.25540066666666666,0.11781183615819207,6.611347,11,76.833123,5.619846,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,mpsf
+ok,0,2.541715,0.8683729717514125,0.7962734124293785,0.77868,8,17.7244,-0.006251,1_pio_oscillation,Latency-induced steering oscillation (PIO),VSD 2025; Orosz IV 2024,qcbf
+ok,1,-1.988842,0.001138746376811594,0.050591724637681156,0.049157,7,72.705358,5.994491,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,none
+ok,0,0.4057,0.18861842028985507,0.10988966666666668,2.534232,11,64.812866,6.15732,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,dob_cbf
+ok,0,1.465417,0.13743315942028983,0.09254575362318841,3.669177,5,70.494386,5.550977,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,mpsf
+ok,0,2.191512,0.8731173188405797,0.7278392898550725,0.801918,4,17.7442,0.013087,2_delayed_hazard,Delayed braking / late hazard response,VSD 2025; 5G eval 2025,qcbf
+ok,1,-2.052572,0.0,0.024688623188405794,0.046003,9,73.528792,5.940645,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,none
+ok,0,2.134512,1.0516721666666669,0.7408124710144928,1.232766,22,15.832985,0.022931,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,dob_cbf
+ok,0,1.54406,0.13817588405797102,0.0655346811594203,3.872866,5,71.939158,5.946052,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,mpsf
+ok,0,2.228351,0.8898612681159419,0.7501664275362319,0.635389,4,15.605368,0.014701,3_missed_obstacle,Missed obstacle (narrow FOV / low awareness),Bogdoll 2022; Orosz 2024,qcbf
+ok,1,-0.807035,0.004429507246376811,0.06941601449275361,0.5372,11,64.426,5.648625,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,none
+ok,0,0.381425,0.07944417391304348,0.0910319347826087,1.45266,7,72.10838,5.482466,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,dob_cbf
+ok,0,1.398581,0.10367654347826087,0.07751777536231884,2.473329,7,71.247827,6.053686,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,mpsf
+ok,0,2.35942,0.829218920289855,0.7321442391304348,0.637695,5,16.862237,0.026584,4_peripheral_hazard,Late-revealed peripheral hazard,Bogdoll 2022,qcbf
+ok,1,0.237259,0.0,0.004347826086956522,24.78475,0,75.422082,9.059247,5_connection_freeze,Connection loss / frozen command,Brettin 2025,none
+ok,0,1.194778,0.03704009420289855,0.04134375362318841,24.879818,2,78.377895,7.389087,5_connection_freeze,Connection loss / frozen command,Brettin 2025,dob_cbf
+ok,0,1.406398,0.03497639130434782,0.010599282608695654,29.53363,2,91.67489,9.075738,5_connection_freeze,Connection loss / frozen command,Brettin 2025,mpsf
+ok,0,2.799393,0.347546115942029,0.43136679710144926,1.329649,1,17.236974,-0.005173,5_connection_freeze,Connection loss / frozen command,Brettin 2025,qcbf
+ok,1,-1.824481,0.0009532826086956524,0.012236608695652174,0.075024,11,95.115655,8.895181,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,none
+ok,0,1.787085,0.7892158695652174,0.6937971014492753,0.340714,13,22.03329,-0.013119,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,dob_cbf
+ok,0,0.682828,0.24026816666666667,0.08169865942028987,5.551593,5,82.939316,8.877898,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,mpsf
+ok,1,0.227117,0.7646742391304348,0.6828527318840579,0.354706,5,23.633247,0.000345,6_overspeed,Overspeed for the latency/conditions (low grip),5G eval 2025; Orosz 2024,qcbf
+ok,1,0.467789,0.00202975796178344,0.043743751592356696,0.059886,12,52.550443,4.635271,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,none
+ok,0,5.237712,0.31274670700636936,1.0,0.023333,19,0.048602,0.001237,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,3.39573,0.26640242675159237,0.47711376433121017,4.122361,5,38.650012,4.037772,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,mpsf
+ok,0,2.175662,0.5670426242038216,0.5779503184713376,2.870578,19,42.142246,5.207053,7_lead_brake_delay,Delayed reaction to lead-vehicle braking,VSD 2025; Orosz IV 2024,qcbf
+ok,1,-1.508344,0.009448955414012737,0.06302358598726114,0.929838,7,80.428267,5.659134,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,none
+ok,0,5.903051,0.6199676878980891,1.0,0.008376,1,0.052772,0.012038,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,dob_cbf
+ok,0,1.71108,0.5673564777070063,0.14019095541401275,5.141869,10,66.88639,5.793583,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,mpsf
+ok,0,4.474787,0.46215333757961785,0.600820101910828,2.290884,32,65.576352,4.653656,8_late_cut_in,Late cut-in by an adjacent vehicle,Bogdoll 2022; VSD 2025,qcbf
+ok,1,-3.586415,0.0,0.004127388535031846,0.647213,0,25.368853,0.549995,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,none
+ok,0,12.236001,0.6567286050955414,0.6,0.014574,2,0.0524,0.002483,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,dob_cbf
+ok,0,2.713176,0.0065837515923566885,0.38791899363057325,0.498418,11,9.591805,0.002357,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,mpsf
+ok,0,2.454197,0.4612805159235669,0.4963781210191083,0.929447,1,9.862348,0.00359,9_freeze_into_stalled,Connection loss approaching a stalled vehicle,Brettin 2025,qcbf
+ok,0,-0.194359,0.003497541401273886,0.05929287898089172,0.021896,31,84.232797,5.619519,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,none
+ok,0,0.78385,0.29046428662420376,0.13518291719745223,1.649945,16,69.014692,5.619487,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,dob_cbf
+ok,0,0.926036,0.15370573248407646,0.09472592356687899,3.71504,13,77.523492,5.606519,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,mpsf
+ok,0,-0.141152,0.2552411210191083,0.2510204904458599,0.391034,20,56.272747,5.505481,10_oncoming_pio,Oncoming vehicle during latency-induced oscillation,VSD 2025; Orosz IV 2024,qcbf

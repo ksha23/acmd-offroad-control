@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this software or its results, please cite the paper below."
+title: "offroad-control: terrain- and latency-aware control on deformable terrain"
+abstract: >-
+  A modular, latency-aware framework for shared and autonomous control of HMMWVs
+  on deformable terrain, built on Project Chrono's SCM (Soil Contact Model)
+  plant: terrain-aware NMPC over a single-tire-rig neural surrogate, joint online
+  estimation of the Bekker exponent and friction angle from vehicle and inertial
+  signals alone, intent-preserving reactive and predictive safety filters, and
+  human-in-the-loop teleoperation under measurement-grounded 5G command and
+  camera latency.
+type: software
+authors:
+  - given-names: Kyle
+    family-names: Sha
+    affiliation: University of Wisconsin-Madison
+    email: kasha2@wisc.edu
+  - given-names: Zhenhao
+    family-names: Zhou
+    affiliation: University of Wisconsin-Madison
+  - given-names: Radu
+    family-names: Serban
+    affiliation: University of Wisconsin-Madison
+  - given-names: Dan
+    family-names: Negrut
+    affiliation: University of Wisconsin-Madison
+license: BSD-3-Clause
+repository-code: "https://github.com/ksha23/offroad-control"
+keywords:
+  - deformable terrain
+  - nonlinear model predictive control
+  - terrain estimation
+  - control barrier functions
+  - teleoperation
+  - Project Chrono
+preferred-citation:
+  type: conference-paper
+  title: "Terrain- and Latency-Aware Shared and Autonomous Control on Deformable Terrain"
+  year: 2026
+  notes: "ACMD 2026; Department of Mechanical Engineering, University of Wisconsin-Madison."
+  authors:
+    - given-names: Kyle
+      family-names: Sha
+    - given-names: Zhenhao
+      family-names: Zhou
+    - given-names: Radu
+      family-names: Serban
+    - given-names: Dan
+      family-names: Negrut

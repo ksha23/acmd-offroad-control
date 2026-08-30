@@ -1,0 +1,3 @@
+filter,n_cells,collisions,collision_rate,mean_clearance_m,baseline_collisions,collisions_prevented,mean_abs_dsteer,mean_abs_dthrottle
+none,45,30,0.667,2.734,,,,
+dob_cbf,45,0,0.0,6.943,30.0,30.0,0.213,0.195

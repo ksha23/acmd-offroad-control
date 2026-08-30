@@ -1,0 +1,40 @@
+key,value
+created_at,2026-08-27T16:27:18
+project_root,/home/ksha/Documents/sbel/offroad-control
+description,Standard MPC tire-model sweep with sensor noise enabled.
+command,/home/ksha/Documents/sbel/offroad-control/benchmarking/mpc_tire_model_sweep.py --models pacejka tmeasy tire_force_static --terrains clay dirt sand --paths sinusoidal lane_change right_left --speeds 5 7 9 --bumpiness 0 4 8 --seeds 5 --time 15 --workers 1 --base-port 20000 --timeout 500.0
+env.HIL_SIM_EXTRA,--simple-powertrain
+env.ACADOS_MPC_BUILD_ROOT,<unset>
+_ros_lease,<_io.TextIOWrapper name='/tmp/offroad_control_acmd_ros.lock' mode='a+' encoding='utf-8'>
+base_port,20000
+base_seed,100
+bumpiness,"[0, 4, 8]"
+lead_in,5.0
+models,"['pacejka', 'tmeasy', 'tire_force_static']"
+output_prefix,'mpc_tire_model_sweep'
+paths,"['sinusoidal', 'lane_change', 'right_left']"
+quick,False
+seeds,5
+speeds,"[5.0, 7.0, 9.0]"
+terrains,"['clay', 'dirt', 'sand']"
+time,15.0
+timeout,500.0
+workers,1
+code_git_head,'cceb1940759bb36543fe04220ebbcabb826ffeec'
+tracked_worktree_dirty,False
+uncommitted_source_files,[]
+paper_evidence_eligible,True
+source_sha256.benchmarking/active_estimator_diagnostics.py,2f9fffc36141b57613a64bcb38c7da5b82d7490535081e2fa0158f665d22ca6f
+source_sha256.benchmarking/common.py,c187efd8d7a5b09e4ce181f99599e9f9510b5ba9c7eb8a2bd1a56df7f8b7f748
+source_sha256.benchmarking/paper_provenance.py,3c31e339f2a29619c51101cfc943688fa17d36e3d7d08bc904f367d1b6bbcc5b
+source_sha256.benchmarking/tire_model_with_estimator_ablation.py,8e1cde20f5b4e4ae5b9a56a0860ab19f66bd1c98e499b264437576e9a57bc71e
+source_sha256.simulation/control/acados_mpc_controller_node.py,aae952207e513595c8cecdf16faa25141930ff2eaf182c4eb2ed8fa082ce3b18
+source_sha256.simulation/estimators/grit_terrain_estimator.py,03fa749ac20398dc0f1718ead0acd9ee068e04a0fb17a36ca832331c99909999
+source_sha256.simulation/estimators/scalar_parent_terrain_estimator.py,25de5ca3481ecfeed93d998f31ce9064913af4babd17bdb6ab22b82ecacb6381
+source_sha256.simulation/estimators/terrain_parameterization.py,7e4355024401c037c2b0b50577d7a17d864cee3b7769ddb087169f4b715314eb
+source_sha256.simulation/runtime/chrono_sim_node.py,24288be0d12cc52acdcaf0fc9b716dfe7f53804791077c89a8d477479d2e577e
+source_sha256.simulation/runtime/launch_decoupled.py,69061c062c3385a96e2a04c57b56869613330a1ea8f09dcfe3acc1488f76b13a
+source_sha256.simulation/shared/param_consistency.py,1249f8cdf4f548e9a062934ce720ad8d1e5f479e073e6ebc788cfc91d67fa70a
+source_sha256.simulation/tire_models/four_wheel_projection.py,9931803e57dfffcab6fae3de26bebd6a306bc6b0208a6d753a714e167bb8c8a6
+source_sha256.simulation/tire_models/nn_tire_model.py,2a43bc6996492ca829fa5c5dd0ea37c632423fd6fde2794abd5e2213a3b0f0c9
+source_sha256.simulation/tire_models/tire_input_features.py,6fe34b46730f0c8c100a5a52e41972f29ced6233ae30005d5bf802d9705ace36

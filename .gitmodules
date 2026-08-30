@@ -1,0 +1,8 @@
+[submodule "third_party/chrono"]
+	path = third_party/chrono
+	url = https://github.com/projectchrono/chrono.git
+	branch = main
+[submodule "third_party/acados"]
+	path = third_party/acados
+	url = https://github.com/acados/acados.git
+	branch = main

@@ -1,0 +1,2 @@
+variant,n_runs,n_ok,rms_cte_m_mean,rms_cte_m_std,mean_abs_cte_m_mean,mean_abs_cte_m_std,speed_ratio_mean,speed_ratio_std,mean_speed_mps_mean,mean_speed_mps_std,mean_solve_ms_mean,mean_solve_ms_std,progress_m_mean,progress_m_std
+pacejka_oracle,405,405,0.48149498824599,0.5613859686904619,0.26588156226545284,0.27054224114186864,0.6942089782116521,0.15168574993444242,4.676951615279351,0.831390906990162,3.2757129006032835,0.853082293411088,63.34661704425743,11.367743166640494

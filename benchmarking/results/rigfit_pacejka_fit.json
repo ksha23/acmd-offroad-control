@@ -1,0 +1,72 @@
+{
+  "train_csv_sha256": "17bd30b5464e49460c7d9a149fc7cec6014342f23477e6a5dcffca420feae31e",
+  "holdout_csv_sha256": "f7267be00019d3e38731aee96c313d31ffd933b8dfb0fc0b7af421b3d8827266",
+  "bandwidth": 0.18,
+  "PACEJKA_RIGFIT": {
+    "clay": {
+      "B": 12.785,
+      "C": 1.2,
+      "E": 0.61,
+      "mu": 0.402
+    },
+    "dirt": {
+      "B": 15.081,
+      "C": 1.2,
+      "E": 0.725,
+      "mu": 0.607
+    },
+    "sand": {
+      "B": 15.556,
+      "C": 1.2,
+      "E": 0.789,
+      "mu": 0.708
+    }
+  },
+  "holdout_report": {
+    "clay": {
+      "effective_n_train": 294.61689675870684,
+      "rigfit": {
+        "holdout_wrmse_N": 350.0,
+        "holdout_wr2": 0.6026
+      },
+      "standard": {
+        "holdout_wrmse_N": 362.5,
+        "holdout_wr2": 0.5738
+      },
+      "oracle": {
+        "holdout_wrmse_N": 433.5,
+        "holdout_wr2": 0.3904
+      }
+    },
+    "dirt": {
+      "effective_n_train": 443.8812460349282,
+      "rigfit": {
+        "holdout_wrmse_N": 537.8,
+        "holdout_wr2": 0.7041
+      },
+      "standard": {
+        "holdout_wrmse_N": 587.3,
+        "holdout_wr2": 0.6472
+      },
+      "oracle": {
+        "holdout_wrmse_N": 543.7,
+        "holdout_wr2": 0.6976
+      }
+    },
+    "sand": {
+      "effective_n_train": 225.43880023277433,
+      "rigfit": {
+        "holdout_wrmse_N": 499.7,
+        "holdout_wr2": 0.6623
+      },
+      "standard": {
+        "holdout_wrmse_N": 555.6,
+        "holdout_wr2": 0.5825
+      },
+      "oracle": {
+        "holdout_wrmse_N": 512.4,
+        "holdout_wr2": 0.645
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "study": "mpsf_solve_scaling",
+  "note": "run one at a time; parallel execution inflates solve times ~2x",
+  "rocks_in_scene": 16,
+  "rows": [
+    {
+      "n_obstacles": 3,
+      "status": "ok",
+      "filter_solve_ms": 4.425,
+      "mpc_solve_ms": 7.953881856540083,
+      "intervention_rate_pct": 65.5,
+      "collisions": 0
+    },
+    {
+      "n_obstacles": 6,
+      "status": "ok",
+      "filter_solve_ms": 5.407,
+      "mpc_solve_ms": 8.039818840579711,
+      "intervention_rate_pct": 65.0,
+      "collisions": 0
+    },
+    {
+      "n_obstacles": 10,
+      "status": "ok",
+      "filter_solve_ms": 3.049,
+      "mpc_solve_ms": 7.369382123575285,
+      "intervention_rate_pct": 62.1,
+      "collisions": 0
+    },
+    {
+      "n_obstacles": 16,
+      "status": "ok",
+      "filter_solve_ms": 1.937,
+      "mpc_solve_ms": 7.934031193761248,
+      "intervention_rate_pct": 72.4,
+      "collisions": 0
+    },
+    {
+      "n_obstacles": null,
+      "flavor": "dob_cbf",
+      "status": "ok",
+      "filter_solve_ms": 1.1850828729281768,
+      "mpc_solve_ms": 7.095657657657658,
+      "intervention_rate_pct": 53.2,
+      "collisions": 0
+    }
+  ]
+}

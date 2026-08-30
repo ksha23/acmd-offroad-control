@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Generate Chrono SCM ground-truth logs for the Dallas UKF validation.
+
+This script runs a *closed-loop* PyChrono HMMWV on the SCM deformable
+terrain (clay or sandy loam = "dirt" preset), driven by a scripted
+sinusoidal steering and a simple cruise-speed throttle. The full body
+state ``[t, x, y, psi, u, v, omega, ax, ay, delta_meas, throttle]`` is
+logged every ``--log-dt`` seconds (default 24 ms — matches the Dallas
+estimator rate) and written to an NPZ.
+
+The companion ``run_dallas_from_log`` entry point in
+``simulation/estimators/ukf_reference_models.py`` replays the UKF against
+these logs in place of an analytical-Bekker half-car reference. Doing so puts
+the UKF's measurements on the same physics that supervises the neural tyre
+surrogate, so a comparison between the two force models measures the models
+rather than a difference between their ground truths.
+
+Usage::
+
+    conda activate sim
+    python data_collection/run_dallas_scm.py --terrain clay --time 50 \\
+        --output data/dallas_scm/clay.npz
+    python data_collection/run_dallas_scm.py --terrain dirt --time 50 \\
+        --output data/dallas_scm/sandy_loam.npz
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[1]
+SIM = REPO / "simulation"
+sys.path.insert(0, str(SIM))
+import flatpath  # noqa: E402,F401
+
+import pychrono as chrono                       # noqa: E402
+import pychrono.vehicle as veh                  # noqa: E402
+
+from chrono_setup import (setup_chrono_vehicle, setup_scm_terrain,   # noqa: E402
+                            load_terrain_config)
+
+
+class _ScriptedDriver(veh.ChDriver):
+    """Driver that accepts an externally set (steer, throttle, brake) each tick.
+
+    Scripted excitation must be applied exactly as computed, so this driver
+    holds the commanded values rather than deriving them from a path follower.
+    """
+
+    def __init__(self, vehicle):
+        super().__init__(vehicle.GetVehicle())
+        self.m_steering = 0.0
+        self.m_throttle = 0.0
+        self.m_braking = 0.0
+
+    def set(self, steer: float, throttle: float, brake: float = 0.0):
+        self.m_steering = float(np.clip(steer, -1.0, 1.0))
+        self.m_throttle = float(np.clip(throttle, 0.0, 1.0))
+        self.m_braking = float(np.clip(brake,    0.0, 1.0))
+
+    def Synchronize(self, time): pass
+    def Advance(self, step): pass
+
+    def GetSteering(self): return self.m_steering
+    def GetThrottle(self): return self.m_throttle
+    def GetBraking(self):  return self.m_braking
+
+
+def _dallas_steer_target_rad(t: float, amp_rad: float, period_s: float) -> float:
+    """Return the sinusoidal steering target of Dallas et al. Fig. 7.
+
+    The excitation is symmetric about zero so the manoeuvre exercises both
+    turn directions equally and leaves no net heading bias.
+    """
+    return amp_rad * math.sin(2.0 * math.pi * t / period_s)
+
+
+def main():
+    p = argparse.ArgumentParser(__doc__)
+    p.add_argument("--terrain", choices=["clay", "dirt", "sand"], default="clay",
+                   help='SCM terrain preset. "dirt" matches Dallas\'s '
+                        '"sandy loam" (n=0.7, Kphi=1515 kPa). Ignored if '
+                        '--terrain-config is given.')
+    p.add_argument("--terrain-config", type=Path, default=None,
+                   help="YAML/JSON soil parameters (Kphi, Kc, n, cohesion, "
+                        "friction_angle, janosi_shear). Overrides --terrain.")
+    p.add_argument("--time", type=float, default=50.0,
+                   help="Sim duration after lead-in (s).")
+    p.add_argument("--lead-in", type=float, default=3.0,
+                   help="Straight-line lead-in before steering excitation (s).")
+    p.add_argument("--target-speed", type=float, default=5.0,
+                   help="Cruise speed setpoint (m/s). Used only when "
+                        "--open-loop-throttle is not set.")
+    p.add_argument("--open-loop-throttle", type=float, default=None,
+                   help="If set to a value >= 0, drive throttle at this "
+                        "constant fraction (Buzhardt-style open-loop "
+                        "excitation) and "
+                        "disable the PI cruise loop. A negative value (e.g. "
+                        "-1) explicitly selects PI cruise to --target-speed.")
+    p.add_argument("--steer-amp-rad", type=float, default=0.50,
+                   help="Steering amplitude (rad). The 0.50 rad default matches "
+                        "the manoeuvre in Dallas et al. Fig. 7a. A larger "
+                        "amplitude produces stronger lateral excitation and "
+                        "therefore tighter identifiability of n for every "
+                        "estimator under comparison.")
+    p.add_argument("--steer-period", type=float, default=3.0,
+                   help="Steering sinusoid period (s).")
+    p.add_argument("--max-steer-rad", type=float, default=0.5,
+                   help="HMMWV max road-wheel steer (rad). Used to scale "
+                        "the [-1,1] steering command.")
+    p.add_argument("--step-size", type=float, default=3e-3,
+                   help="Chrono physics step (s).")
+    p.add_argument("--log-dt", type=float, default=0.024,
+                   help="Logging interval (s) — default 24 ms matches Dallas "
+                        "estimator rate.")
+    p.add_argument("--output", type=Path, required=True,
+                   help="NPZ to write.")
+    p.add_argument("--seed", type=int, default=42)
+    # Spatial soil transition (per-location SCM callback): soil changes type
+    # along +x, so a UKF / MLP replay can be evaluated across a regime shift.
+    p.add_argument("--terrain-transition", action="store_true",
+                   help="Enable a spatial soil transition along +x.")
+    p.add_argument("--terrain-start", choices=["clay", "dirt", "sand"], default=None,
+                   help="Soil before the transition (defaults to --terrain).")
+    p.add_argument("--terrain-end", choices=["clay", "dirt", "sand"], default=None,
+                   help="Soil after the transition.")
+    p.add_argument("--transition-x", type=float, default=45.0,
+                   help="Center of the soil transition in terrain x (m).")
+    p.add_argument("--transition-width", type=float, default=2.0,
+                   help="Full width of the linear soil blend (m); 0 = hard step.")
+    args = p.parse_args()
+
+    np.random.seed(args.seed)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Output : {args.output}")
+    print(f"Terrain: {args.terrain}")
+
+    # --- Chrono setup ------------------------------------------------------
+    system, vehicle = setup_chrono_vehicle(visualize=False)
+    terrain_config = None
+    if args.terrain_config is not None:
+        terrain_config = load_terrain_config(str(args.terrain_config))
+
+    spatial_spec = None
+    base_preset = args.terrain
+    if args.terrain_transition:
+        from spatial_terrain import SpatialTransitionSpec
+        start_preset = args.terrain_start or args.terrain
+        if args.terrain_end is None:
+            raise SystemExit("--terrain-transition requires --terrain-end")
+        spatial_spec = SpatialTransitionSpec(
+            start_preset=start_preset, end_preset=args.terrain_end,
+            transition_x=args.transition_x, transition_width=args.transition_width,
+        )
+        base_preset = start_preset
+        print(f"Transition: {start_preset} -> {args.terrain_end} at "
+              f"x={args.transition_x:.1f}m (blend {args.transition_width:.1f}m)")
+
+    terrain, terrain_params = setup_scm_terrain(
+        system, vehicle=vehicle, visualize=False,
+        terrain_preset=base_preset, terrain_config=terrain_config,
+        mesh_resolution=0.10, spatial_spec=spatial_spec,
+    )
+    driver = _ScriptedDriver(vehicle)
+
+    # Report the assembled mass and soil, so a log can be checked against the
+    # vehicle and terrain it was intended to record.
+    veh_obj = vehicle.GetVehicle()
+    m_chassis = veh_obj.GetChassisBody().GetMass()
+    m_total = m_chassis
+    for ax in veh_obj.GetAxles():
+        for w in ax.GetWheels():
+            m_total += w.GetSpindle().GetMass()
+    print(f"  HMMWV chassis = {m_chassis:.0f} kg, total ≈ {m_total:.0f} kg")
+    print(f"  Soil: Kphi={terrain_params['Kphi']:.0f}, Kc={terrain_params['Kc']:.0f}, "
+          f"n={terrain_params['n']:.2f}")
+
+    # --- Logging buffers ---------------------------------------------------
+    T_total = args.lead_in + args.time
+    n_log = int(T_total / args.log_dt) + 2
+    log = {k: np.zeros(n_log, dtype=np.float64) for k in
+           ["t", "x", "y", "psi", "u", "v", "omega",
+            "ax", "ay", "az",
+            "roll", "pitch",
+            "roll_rate", "pitch_rate",
+            "Fy_tire_total",
+            # Per-axle body-frame tyre forces, plus the vehicle-total
+            # longitudinal force and yaw moment. These are ground-truth
+            # diagnostics for validating the four-wheel projection of the
+            # rig-trained surrogate: per-axle Fx/Fy exercise the control
+            # path, Fy_total and Myaw_tire_total the estimation path.
+            "Fx_axle_f", "Fy_axle_f", "Fx_axle_r", "Fy_axle_r",
+            "Fx_tire_total", "Myaw_tire_total",
+            "w_fl", "w_fr", "w_rl", "w_rr",
+            "delta_meas", "throttle_cmd", "steer_cmd"]}
+
+    # PI cruise loop on longitudinal speed. Holding speed roughly constant
+    # keeps the steering sinusoid the dominant excitation in the log.
+    throttle_int = 0.0
+    KP, KI = 0.30, 0.10
+
+    step_size = args.step_size
+    log_steps = max(1, int(round(args.log_dt / step_size)))
+    n_steps = int(T_total / step_size) + 1
+    print(f"  step_size = {step_size*1000:.1f} ms, log every {log_steps} steps "
+          f"({args.log_dt*1000:.0f} ms), total {n_steps} steps over {T_total:.0f} s")
+
+    t_wall = time.time()
+    log_idx = 0
+    for k in range(n_steps):
+        t = k * step_size
+        chassis = veh_obj.GetChassisBody()
+        rot = chassis.GetRot()
+        vel = chassis.GetPosDt()
+        vel_body = rot.RotateBack(vel)
+        u_meas = vel_body.x
+
+        if args.open_loop_throttle is not None and args.open_loop_throttle >= 0:
+            # Buzhardt-style scripted open-loop throttle; no PI cruise.
+            throttle_cmd = float(np.clip(args.open_loop_throttle, 0.0, 1.0))
+        else:
+            # PI speed governor on u.
+            e = args.target_speed - u_meas
+            throttle_int = float(np.clip(throttle_int + KI * e * step_size,
+                                          -0.2, 1.0))
+            throttle_cmd = float(np.clip(KP * e + throttle_int, 0.0, 1.0))
+
+        # Steering excitation (after lead-in straight section).
+        if t < args.lead_in:
+            steer_target_rad = 0.0
+        else:
+            steer_target_rad = _dallas_steer_target_rad(
+                t - args.lead_in, args.steer_amp_rad, args.steer_period)
+        steer_cmd = float(np.clip(steer_target_rad / args.max_steer_rad,
+                                  -1.0, 1.0))
+        driver.set(steer_cmd, throttle_cmd)
+
+        if k % log_steps == 0 and log_idx < n_log:
+            pos = chassis.GetPos()
+            ang = rot.GetCardanAnglesXYZ()
+            yaw, pitch, roll = ang.z, ang.y, ang.x
+            acc_body = rot.RotateBack(chassis.GetPosDt2())
+            ang_vel_body = chassis.GetAngVelLocal()
+            omega = ang_vel_body.z
+            roll_rate = ang_vel_body.x
+            pitch_rate = ang_vel_body.y
+            delta_meas = 0.5 * (veh_obj.GetSteeringAngle(0, veh.LEFT) +
+                                veh_obj.GetSteeringAngle(0, veh.RIGHT))
+            w_fl = veh_obj.GetSpindleOmega(0, veh.LEFT)
+            w_fr = veh_obj.GetSpindleOmega(0, veh.RIGHT)
+            w_rl = veh_obj.GetSpindleOmega(1, veh.LEFT)
+            w_rr = veh_obj.GetSpindleOmega(1, veh.RIGHT)
+
+            # Accumulate per-axle tyre forces and the yaw moment about the
+            # centre of gravity, in the chassis body frame. ChWheel exposes
+            # ``GetTire().ReportTireForce(terrain)``, which reports the force
+            # at the contact patch, so each contribution is rotated into the
+            # body frame before it is summed. ``GetAxles()`` is ordered
+            # [front, rear] for the HMMWV.
+            Fx_axle = [0.0, 0.0]
+            Fy_axle = [0.0, 0.0]
+            Myaw_tire = 0.0
+            for ai, ax_obj in enumerate(veh_obj.GetAxles()):
+                idx = 0 if ai == 0 else 1
+                for w in ax_obj.GetWheels():
+                    tire = w.GetTire()
+                    if tire is None:
+                        continue
+                    tf = tire.ReportTireForce(terrain)
+                    # Chrono reports tf.force in the world frame for rigid
+                    # tires, so rotate it back into the chassis body frame.
+                    F_body = rot.RotateBack(tf.force)
+                    Fx_axle[idx] += F_body.x
+                    Fy_axle[idx] += F_body.y
+                    # Yaw moment about CG: (r x F).z with the contact point
+                    # relative to the chassis CG, plus the tyre's own
+                    # aligning moment if reported. r and F both body-frame.
+                    r_body = rot.RotateBack(tf.point - pos)
+                    Myaw_tire += r_body.x * F_body.y - r_body.y * F_body.x
+                    try:
+                        Myaw_tire += rot.RotateBack(tf.moment).z
+                    except Exception:
+                        pass
+            Fy_tire = Fy_axle[0] + Fy_axle[1]
+            Fx_tire = Fx_axle[0] + Fx_axle[1]
+
+            log["t"][log_idx]            = t
+            log["x"][log_idx]            = pos.x
+            log["y"][log_idx]            = pos.y
+            log["psi"][log_idx]          = yaw
+            log["u"][log_idx]            = vel_body.x
+            log["v"][log_idx]            = vel_body.y
+            log["omega"][log_idx]        = omega
+            log["ax"][log_idx]           = acc_body.x
+            log["ay"][log_idx]           = acc_body.y
+            log["az"][log_idx]           = acc_body.z
+            log["roll"][log_idx]         = roll
+            log["pitch"][log_idx]        = pitch
+            log["roll_rate"][log_idx]    = roll_rate
+            log["pitch_rate"][log_idx]   = pitch_rate
+            log["Fy_tire_total"][log_idx] = Fy_tire
+            log["Fx_axle_f"][log_idx]    = Fx_axle[0]
+            log["Fy_axle_f"][log_idx]    = Fy_axle[0]
+            log["Fx_axle_r"][log_idx]    = Fx_axle[1]
+            log["Fy_axle_r"][log_idx]    = Fy_axle[1]
+            log["Fx_tire_total"][log_idx] = Fx_tire
+            log["Myaw_tire_total"][log_idx] = Myaw_tire
+            log["w_fl"][log_idx]         = w_fl
+            log["w_fr"][log_idx]         = w_fr
+            log["w_rl"][log_idx]         = w_rl
+            log["w_rr"][log_idx]         = w_rr
+            log["delta_meas"][log_idx]   = delta_meas
+            log["throttle_cmd"][log_idx] = throttle_cmd
+            log["steer_cmd"][log_idx]    = steer_cmd
+            log_idx += 1
+
+        # Chrono step.
+        driver_inputs = veh.DriverInputs()
+        driver_inputs.m_steering = driver.GetSteering()
+        driver_inputs.m_throttle = driver.GetThrottle()
+        driver_inputs.m_braking  = driver.GetBraking()
+
+        driver.Synchronize(t)
+        terrain.Synchronize(t)
+        vehicle.Synchronize(t, driver_inputs, terrain)
+        driver.Advance(step_size)
+        terrain.Advance(step_size)
+        vehicle.Advance(step_size)
+
+    wall_s = time.time() - t_wall
+    print(f"  Done. wall={wall_s:.0f}s ({wall_s/T_total:.2f}× real-time), "
+          f"log rows={log_idx}")
+
+    # Trim and persist.
+    out = {k: v[:log_idx] for k, v in log.items()}
+    out["terrain"] = np.array([args.terrain])
+    out["soil_Kphi"] = np.array([terrain_params["Kphi"]])
+    out["soil_Kc"]   = np.array([terrain_params["Kc"]])
+    out["soil_n"]    = np.array([terrain_params["n"]])
+    out["soil_c"]    = np.array([terrain_params["c"]])
+    out["soil_phi_rad"] = np.array([math.radians(terrain_params["phi"])])
+    out["soil_k"]    = np.array([terrain_params["k"]])
+    out["lead_in"]   = np.array([args.lead_in])
+    if spatial_spec is not None:
+        out["transition"] = np.array([1])
+        out["transition_start"] = np.array([spatial_spec.start_preset])
+        out["transition_end"] = np.array([spatial_spec.end_preset])
+        out["transition_x"] = np.array([spatial_spec.transition_x])
+        out["transition_width"] = np.array([spatial_spec.transition_width])
+    np.savez(args.output, **out)
+    print(f"  Wrote {args.output}")
+
+
+if __name__ == "__main__":
+    main()

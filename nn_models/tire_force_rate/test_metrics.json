@@ -1,0 +1,56 @@
+{
+  "architecture": {
+    "checkpoint_format": "tire_force_rate_mlp",
+    "architecture_type": "mlp",
+    "hidden_sizes": [
+      64,
+      32
+    ],
+    "temporal_K": 1,
+    "rate_augmented": true,
+    "feature_cols": [
+      "slip_ratio",
+      "slip_angle",
+      "velocity",
+      "vertical_load",
+      "steering_rate",
+      "d_slip_ratio",
+      "d_slip_angle",
+      "d_velocity",
+      "bekker_Kphi",
+      "bekker_Kc",
+      "bekker_n",
+      "mohr_cohesion",
+      "mohr_friction",
+      "janosi_shear"
+    ],
+    "input_size": 14,
+    "output_size": 2,
+    "val_loss": 0.012473344802856445,
+    "training_source": "chrono_scm_single_tire_rig",
+    "training_csv_sha256": "17bd30b5464e49460c7d9a149fc7cec6014342f23477e6a5dcffca420feae31e",
+    "load_feature": "commanded",
+    "operating_point": "commanded",
+    "seed": 42,
+    "n_params": 3106
+  },
+  "test": {
+    "r2_fx": 0.991342204741573,
+    "r2_fy": 0.988382681632172,
+    "rmse_fx": 165.62316758828018,
+    "rmse_fy": 108.14861630048976,
+    "mae_fx": 86.46243543904926,
+    "mae_fy": 48.65825553336787
+  },
+  "holdout": {
+    "r2_fx": 0.9622719199404801,
+    "r2_fy": 0.4691213779383161,
+    "rmse_fx": 353.3859645317374,
+    "rmse_fy": 738.9328717812269,
+    "mae_fx": 212.09922746360954,
+    "mae_fy": 526.5600261431036,
+    "holdout_csv": "/home/ksha/Documents/sbel/offroad-control/data/tire_rig_commanded/holdout.csv",
+    "holdout_csv_sha256": "f7267be00019d3e38731aee96c313d31ffd933b8dfb0fc0b7af421b3d8827266",
+    "holdout_rows": 6223
+  }
+}

@@ -1,0 +1,57 @@
+# Reproducible Python environment for offroad-control.
+#
+# Covers the pip/conda-installable stack, pinned to the versions this project
+# is developed and validated against.
+#
+#   conda env create -f environment.yml      # creates env "scm-terrain"
+#   conda activate scm-terrain
+#
+# ── External prerequisites (built from source, NOT installable here) ─────────
+# Two dependencies are compiled from source and are intentionally left out of
+# this file. The autonomous/benchmark code needs PyChrono; running the NMPC
+# controller additionally needs acados.
+#
+#  1) PyChrono — build Project Chrono (github.com/projectchrono/chrono) FROM
+#     SOURCE with the Python module AND the modules this project uses enabled:
+#         -DCH_ENABLE_MODULE_PYTHON=ON     (SWIG Python bindings)
+#         -DCH_ENABLE_MODULE_VEHICLE=ON    (HMMWV + SCM deformable terrain)
+#         -DCH_ENABLE_MODULE_IRRLICHT=ON   (chase-cam visualization)
+#         -DCH_ENABLE_MODULE_SENSOR=ON     (ray-traced driver-POV camera; needs
+#                                           CUDA + NVIDIA OptiX SDK + GLFW/GLEW)
+#         -DCH_ENABLE_MODULE_ROS=ON        (Chrono::ROS state and /clock
+#                                           publishers; needs ROS 2 Jazzy)
+#     Then expose the build's python bindings on the interpreter path:
+#         export PYTHONPATH="<chrono_build>/bin:$PYTHONPATH"
+#     (no conda/pip pychrono is used here; see SETUP.md for full build notes.
+#      The conda-forge `pychrono` package does not ship the Sensor module, so
+#      the camera POV requires the source build.)
+#
+#  2) acados — build acados (github.com/acados/acados) from source, then
+#         pip install -e <acados>/interfaces/acados_template
+#         export ACADOS_SOURCE_DIR=<acados>
+#         export LD_LIBRARY_PATH="<acados>/lib:$LD_LIBRARY_PATH"
+#     Needed only to RUN the acados NMPC controller (not for the tire/estimator
+#     benchmarks or the paper-figure regeneration).
+#
+# Tip: put the two exports in
+#   $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
+# so they are set automatically when the env is activated.
+name: scm-terrain
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12          # matches the pinned Chrono build's ABI (libpython3.12)
+  - numpy=1.26.4
+  - scipy=1.15.2
+  - pandas=2.3.3
+  - matplotlib=3.10.9
+  - scikit-learn=1.7.2
+  - pyyaml=6.0.3            # terrain/scenario config parsing (chrono_setup)
+  - pip
+  - pip:
+      - casadi==3.6.7          # NMPC + differentiable tire-surrogate export
+      - pyzmq==27.1.0          # decoupled sim<->controller messaging
+      - pygame==2.6.1          # G29 wheel input + delayed driver-POV window
+      - torch>=2.1             # tire-rig surrogate loading/training (CPU sufficient)
+      - msgpack>=1.0           # optional: fast ZMQ serialization (guarded; falls back if absent)
+      - PySDL2>=0.9            # optional: G29 force feedback (guarded)

@@ -1,0 +1,4 @@
+variant,n,collisions,collision_rate,mean_clearance_m,blind_collisions_prevented_by_awareness
+none,30,23,0.767,1.693,
+dob_blind,30,6,0.2,4.981,
+dob_aware,30,6,0.2,5.324,0.0

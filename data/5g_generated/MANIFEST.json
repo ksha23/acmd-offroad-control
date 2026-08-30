@@ -1,0 +1,9 @@
+{
+  "status": "DERIVED",
+  "role": "environment traffic traces (latency generation); trains no model in this repository",
+  "generator": "benchmarking/train_5g_nhits.py wrapping the public 0913ktg/5G-Traffic-Generator (N-HiTS-5G)",
+  "upstream_dataset": "328-hour commercial-5G packet captures (Choi et al., IEEE Communications Magazine 2023), GeForce-NOW application traffic, UL and DL",
+  "contents": "scm_geforce_ul_real/ and scm_geforce_dl_real/, each holding generated_traffic.csv and summary.json for one link direction",
+  "consumers": "data/latency_profiles/5g_nhits_geforce.json via the 5g_repo_csv source kind; mapped to one-way latency by the queue-load model in simulation/scenarios/latency_profile.py",
+  "note": "Not a tire or terrain corpus. Every learned component of the control and estimation stack is supervised by the controlled single-tire Chrono SCM rig; this generator sits outside that stack, trains no model in this repository, and touches no vehicle or terrain quantity."
+}

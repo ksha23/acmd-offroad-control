@@ -1,0 +1,17 @@
+{
+  "corpus": "tire_rig_commanded",
+  "status": "DERIVED",
+  "role": "training and holdout corpus for the deployed tire-force surrogates nn_models/tire_force_static and nn_models/tire_force_rate",
+  "contents": "train.csv and holdout.csv: uniform-LHS single-tire Chrono SCM rig samples with per-wheel (Fx, Fy, My, sinkage) labels, all six Bekker-Mohr parameters, and both the commanded and the tire-computed operating point",
+  "collector": "data_collection/build_rig_cmd/collect_rate_data, built from data_collection/collect_rate_data.cpp",
+  "repo_head": "a8ab13fd7ee6f391530683178a0857afdd22b052",
+  "binary_sha256": "5d65411f659df5e5bbe59d58d0aac4aeb71a3cc8ce29f01b016c76a428e110d1",
+  "build_flags": "-O2 -fopenmp -std=c++17, no -DCHRONO_OPENMP; sharding for parallelism",
+  "ranges": "collector defaults, with mesh spacing pinned to the deployed 0.08 m",
+  "seeds": {
+    "train": 42,
+    "holdout": 314
+  },
+  "train_on": "--operating-point commanded",
+  "note": "The kappa_cmd, alpha_cmd, and velocity_cmd columns carry the full commanded operating range, including the +/-0.40 rad slip-angle span the surrogate depends on. Training selects them with --operating-point commanded; the rate-mode inputs are ignored when nn_training/train_variant.py runs in static mode."
+}
