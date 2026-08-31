@@ -43,9 +43,9 @@ def _trace(name):
 def main() -> int:
     m = pd.read_csv(FIG / "grit_adaptive_speed_matrix_summary.csv")
     m = m.set_index(["variant", "terrain"])
-    plt.rcParams.update({"font.size": 14, "axes.labelsize": 14, "axes.titlesize": 14.5,
+    plt.rcParams.update({"font.size": 14, "axes.labelsize": 13, "axes.titlesize": 13,
                      "xtick.labelsize": 12.5, "ytick.labelsize": 12.5})
-    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(12.0, 3.5))
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(12.0, 4.0))
 
     # --- (a) adaptation trace ---
     axA.axvspan(0, TRANSITION_X, color=CLAYC, alpha=0.06)
@@ -53,7 +53,8 @@ def main() -> int:
     axA.axvline(TRANSITION_X, ls="--", color="0.4", lw=1)
     for arm in ("aggressive", "conservative", "grit"):
         t = _trace(arm)
-        axA.plot(t.x_fa_meas, t.u_meas, color=ARMC[arm], lw=1.7, label=f"{arm}", zorder=3)
+        axA.plot(t.x_fa_meas, t.u_meas, color=ARMC[arm], lw=1.7,
+                 label=("GRIT" if arm == "grit" else arm), zorder=3)
     phi_c = "#6a3d9a"
     axP = axA.twinx()
     tg = _trace("grit")
@@ -75,13 +76,14 @@ def main() -> int:
     axP.tick_params(axis="y", labelcolor=phi_c)
     axA.set_xlabel("distance along path $x$ (m)")
     axA.set_ylabel("forward speed $u$ (m/s)")
-    axA.set_title("(a) clay$\\rightarrow$sand traverse (illustrative)")
+    axA.set_title("(a) clay$\\rightarrow$sand traverse (illustr.)")
     axA.text(10, axA.get_ylim()[1] - 0.12, "clay", color=CLAYC, ha="center", va="top", fontsize=13)
     axA.text(60, axA.get_ylim()[1] - 0.12, "sand", color=SANDC, ha="center", va="top", fontsize=13)
     h1, l1 = axA.get_legend_handles_labels()
     h2, l2 = axP.get_legend_handles_labels()
-    axA.legend(h1 + h2, l1 + l2, loc="lower right", fontsize=11, framealpha=0.85,
-               handlelength=1.5, borderpad=0.3, labelspacing=0.25, borderaxespad=0.3)
+    axA.legend(h1 + h2, l1 + l2, loc="upper center", bbox_to_anchor=(0.5, -0.30),
+               fontsize=10, ncol=2, frameon=False, handlelength=1.5,
+               borderpad=0.3, labelspacing=0.25, columnspacing=1.0)
 
     # --- grouped bars helper (error bars = standard error over the n cells) ---
     def bars(ax, col, sd_col):
@@ -91,22 +93,24 @@ def main() -> int:
             err = [(m.loc[(arm, t), sd_col] / np.sqrt(m.loc[(arm, t), "n"]))
                    if (arm, t) in m.index else 0 for t in TERR]
             ax.bar(x + (i - 1.5) * w, vals, w, yerr=err, capsize=2,
-                   color=ARMC[arm], label=arm, edgecolor="k", linewidth=0.4)
+                   color=ARMC[arm], label=("GRIT" if arm == "grit" else arm),
+                   edgecolor="k", linewidth=0.4)
         ax.set_xticks(x); ax.set_xticklabels(list(TERR))
 
     # --- (b) speed ---
     bars(axB, "mean_u", "mean_u_sd")
     axB.set_ylabel("mean forward speed (m/s)")
-    axB.set_title("(b) speed: GRIT $\\approx$ oracle")
-    axB.legend(fontsize=11, ncol=2, loc="lower center")
+    axB.set_title("(b) GRIT $\\approx$ oracle speed")
+    axB.legend(fontsize=10, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.13),
+               frameon=False, columnspacing=1.0)
     axB.grid(axis="y", alpha=0.25)
 
     # --- (c) safety (mean per-run peak crosstrack error) ---
     bars(axC, "max_cte", "max_cte_sd")
     axC.axhline(0.8, ls="--", color="#c0392b", lw=1)
     axC.text(2.42, 0.9, "off path", color="#c0392b", fontsize=13, va="bottom", ha="right")
-    axC.set_ylabel("mean peak crosstrack error (m)")
-    axC.set_title("(c) safety: only the high-grip prior leaves the path")
+    axC.set_ylabel("peak crosstrack error (m)")
+    axC.set_title("(c) high-grip prior leaves the path")
     axC.grid(axis="y", alpha=0.25)
 
     fig.tight_layout(w_pad=2.4)
