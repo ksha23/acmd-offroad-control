@@ -53,6 +53,19 @@ _ACADOS_BUILD_ROOT = Path(
                    Path.home() / ".cache" / "scm_mpsf_acados"))
 
 
+def _nn_loader():
+    """The rig surrogate loader, whether the repo root or simulation/ is on sys.path.
+
+    chrono_sim_node puts simulation/ on the path and the tests put the repo root
+    there. A failed import here used to drop MPSF to soil-blind authority.
+    """
+    try:
+        from simulation.tire_models.nn_tire_model import load_nn_tire_model
+    except ModuleNotFoundError:
+        from tire_models.nn_tire_model import load_nn_tire_model
+    return load_nn_tire_model
+
+
 class MPSFSafetyFilter:
     """Predictive safety filter over a short kinematic-bicycle horizon.
 
@@ -236,7 +249,7 @@ class MPSFSafetyFilter:
                 return None
             n = float(terrain["n"])
             if self._nn is None:
-                from simulation.tire_models.nn_tire_model import load_nn_tire_model
+                load_nn_tire_model = _nn_loader()
                 self._nn = load_nn_tire_model(self.nn_model_dir, terrain)
             nn = self._nn
             best = 0.0
@@ -272,7 +285,7 @@ class MPSFSafetyFilter:
             soil_key = (round(n, 3), round(float(terrain["phi"]), 2),
                         round(float(terrain["c"]), 1))
             if self._nn is None:
-                from simulation.tire_models.nn_tire_model import load_nn_tire_model
+                load_nn_tire_model = _nn_loader()
                 self._nn = load_nn_tire_model(self.nn_model_dir, terrain)
             nn = self._nn
             best = 0.0
