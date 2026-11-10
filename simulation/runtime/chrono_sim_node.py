@@ -1594,6 +1594,10 @@ def run_sim_node(args):
     _t_loop_total = 0.0; _t_state_extract = 0.0; _t_rt_sleep = 0.0
     _t_report_steps = 0; _sensor_calls = 0
 
+    # Where the safety filter's one-way delay comes from (--safety-delay-source).
+    _dsrc = getattr(args, "safety_delay_source", "oracle")
+    _tau_hat = None   # measured command age, smoothed
+    _tau_log = []     # (injected, used) delay at each filter call, for the run summary
     while True:
         _t_loop_start = wall_time.time()
         time_chrono = vehicle.GetSystem().GetChTime()
@@ -1608,8 +1612,12 @@ def run_sim_node(args):
         if safety_filter is not None:
             # Delay-blind ablation: the filter is not told the delay even though
             # the channels are still delayed by the profile.
-            safety_filter.set_teleop_delay(
-                0.0 if getattr(args, "safety_delay_blind", False) else control_delay_s)
+            if getattr(args, "safety_delay_blind", False):
+                safety_filter.set_teleop_delay(0.0)
+            elif _dsrc == "measured":
+                safety_filter.set_teleop_delay(_tau_hat or 0.0)
+            else:
+                safety_filter.set_teleop_delay(control_delay_s)
         if args.synthetic_operator:
             # The operator perceives its own state through the video channel.
             driver.perception_delay = camera_delay_s
@@ -1669,11 +1677,20 @@ def run_sim_node(args):
                 driver_inputs.m_steering,
                 driver_inputs.m_throttle,
                 driver_inputs.m_braking,
+                time_chrono,   # send time, so the receiver can measure command age
             ))
             released_manual = manual_cmd_buffer.pop_latest(time_chrono)
             if released_manual is not None:
                 delayed_manual_inputs[0], delayed_manual_inputs[1], \
-                    delayed_manual_inputs[2] = released_manual
+                    delayed_manual_inputs[2] = released_manual[:3]
+                if _dsrc == "measured":
+                    # Command age at release, in simulation time, through a first-order smoother.
+                    _age = time_chrono - released_manual[3]
+                    if _tau_hat is None:
+                        _tau_hat = _age
+                    else:
+                        _gain = step_size / (float(args.safety_delay_tc) + step_size)
+                        _tau_hat += _gain * (_age - _tau_hat)
                 # A delayed manual command actuating IS a command arriving over
                 # the link: record it so the filter's stale-command emergency
                 # brake is live in replay and synthetic-operator runs. During
@@ -1692,6 +1709,14 @@ def run_sim_node(args):
         # Safety filter at ~10Hz
         sf_interval = max(1, int(1.0 / (10.0 * step_size)))  # 10 Hz, matching MPC rate
         if safety_filter is not None and step_count % sf_interval == 0:
+            # Set right before the call so the filter's own command-age smoother cannot override it.
+            if not getattr(args, "safety_delay_blind", False):
+                if _dsrc == "measured":
+                    safety_filter.set_teleop_delay(_tau_hat or 0.0)
+                elif _dsrc == "oracle_exact":
+                    safety_filter.set_teleop_delay(manual_delay_s if _manual_mode else control_delay_s)
+            _tau_log.append((manual_delay_s if _manual_mode else control_delay_s,
+                             float(getattr(safety_filter, "_teleop_delay", float("nan")))))
             chassis_body = vehicle.GetChassisBody()
             veh_pos = chassis_body.GetPos()
             veh_rot = chassis_body.GetRot()
@@ -2129,6 +2154,12 @@ def run_sim_node(args):
         print(f"  [IMU] analytical model used (no IMU sensor configured): "
               f"accel={_imu_fb['accel_steps']} gyro={_imu_fb['gyro_steps']} step(s).")
 
+    if _tau_log:
+        _tl = np.array(_tau_log)
+        print(f"  [DELAY-SOURCE] {_dsrc}{' blind' if getattr(args, 'safety_delay_blind', False) else ''}: "
+              f"injected mean {np.nanmean(_tl[:, 0]) * 1000:.1f} ms, used mean {np.nanmean(_tl[:, 1]) * 1000:.1f} ms, "
+              f"mean abs diff {np.nanmean(np.abs(_tl[:, 1] - _tl[:, 0])) * 1000:.1f} ms, calls {len(_tl)}")
+
     # Safety filter summary
     if safety_filter is not None:
         diag = safety_filter.get_diagnostics()
@@ -2229,6 +2260,10 @@ def main():
                    help="Force the safety filter's teleop_delay to 0 (delay-blind) "
                         "even under a latency profile, for the blind-vs-aware "
                         "latency ablation.")
+    p.add_argument("--safety-delay-source", choices=["oracle", "oracle_exact", "measured"], default="oracle",
+                   help="Where the safety filter's one-way command delay comes from. oracle (the paper): the injected delay, set once per step, after which DOB-CBF's wall-clock command-age smoother pulls it to about 0.85 of the injected value in replay and synthetic-operator runs. oracle_exact: the injected delay, set right before every filter call. measured: the filter never sees the injected delay and uses the age of operator commands at release, in simulation time, smoothed with --safety-delay-tc. measured covers operator commands only.")
+    p.add_argument("--safety-delay-tc", type=float, default=0.2,
+                   help="Time constant (s) of the measured command-age smoother.")
     p.add_argument("--replay-cmds", type=str, default="",
                    help="Counterfactual replay: drive the ego from a recorded "
                         "operator command trace CSV (steering_op/throttle_op/"
