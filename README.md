@@ -1,8 +1,9 @@
 # Terrain- and latency-aware control on deformable terrain
 
 This repository is the reproducible implementation and benchmark suite for
-*Terrain- and Latency-Aware Shared and Autonomous Control on Deformable
-Terrain* (ACMD 2026, `my_paper/acmd_fullpaper.tex`).
+*Terrain-Aware, Latency-Robust Control for Off-Road Autonomy and
+Teleoperation* (Sha, Zhou, Serban, Negrut, ACMD 2026,
+`my_paper/acmd_fullpaper.tex`).
 
 Every learned component of the control and estimation stack is supervised by
 the controlled single-tire Chrono SCM rig, which records per-wheel SCM forces

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Open-loop numerical convergence of the multibody/SCM plant under refinement.
 
-This study produces the two monotone refinement sequences the manuscript cites
-in Sec. 2 as evidence that the deployed discretization is converged: RMS and
-maximum planar deviation against the finest member of the physics-step family
-and of the SCM-grid family.
+This study produces the two refinement sequences the manuscript cites in its
+Discussion: RMS and maximum planar deviation against the finest member of the
+physics-step family and of the SCM-grid family. The deployed discretization is
+not converged in absolute position (the deviations exceed several paper effect
+sizes), which is why every paper comparison is between paired arms.
 
 A closed-loop tracking metric cannot isolate discretization error: the controller
 runs asynchronously over ROS 2, so its effective bandwidth and the achieved speed
@@ -21,8 +22,8 @@ With no controller, no sensor noise, and an identical command sequence, the only
 difference between runs is the discretization, so the trajectory spread is
 numerical error. Each family is compared against its own finest member as the
 reference solution, reporting the RMS and maximum position deviation over the
-common time grid; convergence means those deviations shrink under refinement and
-that the deployed setting already sits near the reference.
+common time grid. Convergence would mean those deviations shrink under
+refinement and that the deployed setting sits near the reference.
 """
 from __future__ import annotations
 import argparse

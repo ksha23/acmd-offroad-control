@@ -35,9 +35,12 @@ keywords:
   - Project Chrono
 preferred-citation:
   type: conference-paper
-  title: "Terrain- and Latency-Aware Shared and Autonomous Control on Deformable Terrain"
+  title: "Terrain-Aware, Latency-Robust Control for Off-Road Autonomy and Teleoperation"
   year: 2026
-  notes: "ACMD 2026; Department of Mechanical Engineering, University of Wisconsin-Madison."
+  conference:
+    name: "12th Asian Conference on Multibody Dynamics (ACMD 2026)"
+    city: "Okinawa"
+    country: "JP"
   authors:
     - given-names: Kyle
       family-names: Sha

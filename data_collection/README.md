@@ -10,9 +10,10 @@ The neural training path consists of two Chrono SCM `ChTireTestRig` collectors:
 Both write exact per-wheel SCM `(Fx, Fy, My, sinkage)` labels together with the
 operating point and all six Bekker–Mohr parameters. `My` is the spin-axis
 contact moment at the spindle, and `sinkage` is wheel penetration relative to
-the initially undeformed rig surface. Mesh spacing is pinned to the deployed
-`0.08` m through `--mesh-spacing` rather than sampled over `0.08`–`0.12`, so the
-surrogate is trained on the grid the runtime uses.
+the initially undeformed rig surface. The corpus behind the deployed checkpoints
+(`data/tire_rig_commanded`) samples SCM mesh spacing over `0.08`–`0.12` m with the
+other inputs, so the runtime's `0.08` m grid sits at the low edge of the training
+range. `--mesh-spacing` pins a single value for a new collection.
 
 `run_dallas_scm.py` is an evaluation collector rather than a neural-model
 trainer. It records HMMWV state and IMU traces used to validate the four-wheel
