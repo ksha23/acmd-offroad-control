@@ -114,6 +114,30 @@ def validate_rows(frame: pd.DataFrame, mode: str) -> pd.DataFrame:
     return frame.loc[mask, keep].reset_index(drop=True)
 
 
+def apply_feature_choices(frame: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Map the operating-point and load columns the way --operating-point and
+    --load-feature ask. Training and holdout frames both go through here."""
+    if args.operating_point == "commanded":
+        # The rig commands slip angle over +/-0.40 rad but the tire's internal
+        # accessor realises only about a quarter of that, so a surrogate trained on
+        # the tire-computed column sees a domain four times too narrow. The
+        # commanded columns restore the intended coverage, and match what the
+        # controller supplies at runtime: an estimate from vehicle state, not the
+        # tire model's internal slip state.
+        missing = [c for c in ("kappa_cmd", "alpha_cmd", "velocity_cmd") if c not in frame]
+        if missing:
+            raise SystemExit(f"--operating-point commanded needs columns {missing}; "
+                             "recollect with a collector that records them")
+        frame = frame.assign(slip_ratio=frame["kappa_cmd"],
+                             slip_angle=frame["alpha_cmd"],
+                             velocity=frame["velocity_cmd"])
+    if args.load_feature == "measured":
+        # Substitute in place so the runtime feature order is unchanged; the
+        # controller keeps passing its weight-transfer load into the same slot.
+        frame = frame.assign(vertical_load=frame["Fz"])
+    return frame
+
+
 class MLP(nn.Module):
     def __init__(self, input_size: int, hidden: list[int]):
         super().__init__()
@@ -204,24 +228,7 @@ def main() -> int:
             raise SystemExit(f"--drop-features names unknown columns: {sorted(unknown)}")
         feature_cols = [c for c in feature_cols if c not in drop]
         LOG.info("dropped %d feature(s): %s", len(drop), ", ".join(sorted(drop)))
-    if args.operating_point == "commanded":
-        # The rig commands slip angle over +/-0.40 rad but the tire's internal
-        # accessor realises only about a quarter of that, so a surrogate trained on
-        # the tire-computed column sees a domain four times too narrow. The
-        # commanded columns restore the intended coverage, and match what the
-        # controller supplies at runtime: an estimate from vehicle state, not the
-        # tire model's internal slip state.
-        missing = [c for c in ("kappa_cmd", "alpha_cmd", "velocity_cmd") if c not in frame]
-        if missing:
-            raise SystemExit(f"--operating-point commanded needs columns {missing}; "
-                             "recollect with a collector that records them")
-        frame = frame.assign(slip_ratio=frame["kappa_cmd"],
-                             slip_angle=frame["alpha_cmd"],
-                             velocity=frame["velocity_cmd"])
-    if args.load_feature == "measured":
-        # Substitute in place so the runtime feature order is unchanged; the
-        # controller keeps passing its weight-transfer load into the same slot.
-        frame = frame.assign(vertical_load=frame["Fz"])
+    frame = apply_feature_choices(frame, args)
     values = frame[feature_cols].to_numpy(np.float32)
     labels = frame[OUT_COLS].to_numpy(np.float32)
     x_train, x_tmp, y_train, y_tmp = train_test_split(
@@ -305,6 +312,8 @@ def main() -> int:
     if args.holdout:
         holdout_path = Path(args.holdout).expanduser().resolve()
         holdout_frame = validate_rows(pd.read_csv(holdout_path), args.mode)
+        # The holdout must see the same operating-point and load columns as training.
+        holdout_frame = apply_feature_choices(holdout_frame, args)
         h_x = holdout_frame[feature_cols].to_numpy(np.float32)
         h_y = holdout_frame[OUT_COLS].to_numpy(np.float32)
         h_t = torch.tensor(x_scaler.transform(h_x), dtype=torch.float32, device=device)

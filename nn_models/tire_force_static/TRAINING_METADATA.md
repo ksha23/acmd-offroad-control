@@ -18,6 +18,6 @@
 
 ## Independent holdout
 
-- **CSV**: `/home/ksha/Documents/sbel/offroad-control/data/tire_rig_commanded/holdout.csv` (6,223 rows).
+- **CSV**: `data/tire_rig_commanded/holdout.csv` (6,223 rows).
 - **SHA-256**: `f7267be00019d3e38731aee96c313d31ffd933b8dfb0fc0b7af421b3d8827266`.
-- **Scores**: R2 Fx = 0.9723, R2 Fy = 0.4654, MAE Fx = 183.6 N, MAE Fy = 528.1 N.
+- **Scores**: R2 Fx = 0.9430, R2 Fy = 0.9842, MAE Fx = 129.5 N, MAE Fy = 51.7 N (re-scored with `nn_training/rescore_holdout.py` at the commanded operating point the network was trained on. The original trainer scored the holdout on the achieved-slip columns, which gave R2 Fy near 0.47).

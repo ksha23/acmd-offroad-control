@@ -43,14 +43,16 @@
     "mae_fy": 48.65825553336787
   },
   "holdout": {
-    "r2_fx": 0.9622719199404801,
-    "r2_fy": 0.4691213779383161,
-    "rmse_fx": 353.3859645317374,
-    "rmse_fy": 738.9328717812269,
-    "mae_fx": 212.09922746360954,
-    "mae_fy": 526.5600261431036,
-    "holdout_csv": "/home/ksha/Documents/sbel/offroad-control/data/tire_rig_commanded/holdout.csv",
+    "r2_fx": 0.9884368860273939,
+    "r2_fy": 0.9906978658487042,
+    "rmse_fx": 195.63851021778484,
+    "rmse_fy": 97.813472389165,
+    "mae_fx": 92.13878316736837,
+    "mae_fy": 48.99213848004586,
+    "holdout_csv": "data/tire_rig_commanded/holdout.csv",
     "holdout_csv_sha256": "f7267be00019d3e38731aee96c313d31ffd933b8dfb0fc0b7af421b3d8827266",
-    "holdout_rows": 6223
+    "holdout_rows": 6223,
+    "operating_point": "commanded",
+    "load_feature": "commanded"
   }
 }
