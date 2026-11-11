@@ -1078,11 +1078,14 @@ def run_sim_node(args):
                                                 or _belief_mode == "none"),
                      "sense_range": float(args.filter_sense_range),
                      "terminal_set": bool(args.mpsf_terminal_set),
+                     "dynamic_model": bool(args.mpsf_dynamic),
+                     "psf_cost": str(args.mpsf_psf_cost),
                      "w_rest": float(args.mpsf_w_rest),
                      "brake_margin": float(args.mpsf_brake_margin),
                      "time_steps": _parse_time_grid(args.mpsf_time_grid)}
                     if args.safety_flavor in ("mpsf", "predictive", "mpc_safety")
-                    else {"braking_barrier": bool(args.cbf_braking_barrier),
+                    else {"theory": bool(args.cbf_theory),
+                          "braking_barrier": bool(args.cbf_braking_barrier),
                           "brake_margin": float(args.cbf_brake_margin),
                           "gamma_brake": float(args.cbf_gamma_brake),
                           "sense_range": float(args.filter_sense_range)})
@@ -1109,8 +1112,11 @@ def run_sim_node(args):
         print(f"  [SAFETY-CFG] sense_range={args.filter_sense_range} "
               f"sim_clock={bool(args.safety_sim_clock)} "
               f"mpsf_terminal_set={bool(args.mpsf_terminal_set)} "
+              f"mpsf_dynamic={bool(args.mpsf_dynamic)} "
+              f"mpsf_psf_cost={args.mpsf_psf_cost} "
               f"mpsf_grid={args.mpsf_time_grid or '0.1x20'} "
-              f"cbf_braking_barrier={bool(args.cbf_braking_barrier)}", flush=True)
+              f"cbf_braking_barrier={bool(args.cbf_braking_barrier)} "
+              f"cbf_theory={bool(args.cbf_theory)}", flush=True)
         if args.safety_sim_clock and hasattr(safety_filter, "set_clock"):
             safety_filter.set_clock(lambda: _sim_clock[0])
 
@@ -1777,10 +1783,15 @@ def run_sim_node(args):
                         # 4th element False => static rock (CBF prefers steering)
                         all_obstacles.append((rock_pos[i, 0], rock_pos[i, 1], rock_rad[i], False))
             if traffic_mgr is not None:
-                for ox, oy, orad in traffic_mgr.obstacles():
+                for st in traffic_mgr.states():
+                    ox, oy, orad = st["x"], st["y"], st["r"]
                     if (ox - veh_pos.x) ** 2 + (oy - veh_pos.y) ** 2 < float(args.filter_sense_range) ** 2:
-                        # 4th element True => vehicle (CBF weights braking equally)
-                        all_obstacles.append((ox, oy, orad, True))
+                        # 4th element True => vehicle (CBF weights braking equally).
+                        # 5th and 6th: its planar velocity, which the filters that
+                        # predict obstacle motion read and the published ones ignore.
+                        all_obstacles.append((ox, oy, orad, True,
+                                              st["speed"] * np.cos(st["psi"]),
+                                              st["speed"] * np.sin(st["psi"])))
 
             veh_state = {
                 'x': veh_pos.x, 'y': veh_pos.y, 'psi': veh_psi,
@@ -2561,6 +2572,17 @@ def main():
                         "executed input, and the horizon-tied speed funnel is off. "
                         "Safety then does not depend on the horizon length. The "
                         "default is the published formulation.")
+    p.add_argument("--mpsf-dynamic", action="store_true",
+                   help="MPSF only: the standard predictive safety filter on the "
+                        "surrogate dynamic bicycle (simulation/safety/surrogate_dynamics.py, "
+                        "the NMPC's model): the published cost, constraints tightened by "
+                        "the model's error against the plant, and a terminal set from "
+                        "which straight braking stops clear. Independent of "
+                        "--mpsf-terminal-set.")
+    p.add_argument("--mpsf-psf-cost", choices=["horizon", "first"], default="first",
+                   help="With --mpsf-dynamic: 'first' (default) charges deviation on the "
+                        "executed input only (the textbook predictive safety filter), "
+                        "'horizon' on every planned stage (the published MPSF's cost).")
     p.add_argument("--mpsf-time-grid", type=str, default="",
                    help="MPSF only: horizon time grid as comma-separated DTxN "
                         "groups, e.g. 0.1x10,0.3x10 for 4 s in 20 steps. The first "
@@ -2572,6 +2594,14 @@ def main():
                    help="MPSF terminal set only: fraction of the surrogate's peak "
                         "braking deceleration the plan may use. The plant reaches "
                         "87 to 94 percent of it under full brake.")
+    p.add_argument("--cbf-theory", action="store_true",
+                   help="DOB-CBF only: the textbook DOB-CBF (simulation/safety/"
+                        "dob_cbf_theory.py): high-order CBF on the ellipse with real "
+                        "roots, braking-distance and sensing-edge barriers on the "
+                        "surrogate's soil braking, a disturbance observer whose error "
+                        "bound tightens every row, hard constraints, full braking with "
+                        "steering held when infeasible. The default is the published "
+                        "filter.")
     p.add_argument("--cbf-braking-barrier", action="store_true",
                    help="DOB-CBF only: add the braking-distance barrier rows "
                         "(gap - v^2/(2 a_h) on lane obstacles and on the sensing "

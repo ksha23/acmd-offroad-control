@@ -134,6 +134,38 @@ command until no safe trajectory remains and does not exhibit it.
 `benchmarking/audit_stalled_runs.py` reports how often any result set ends
 stopped, and why.
 
+### Textbook DOB-CBF (`--cbf-theory`)
+
+`dob_cbf_theory.py` implements the same filter with only the parts the theory
+specifies. The published filter above stays the default, unchanged.
+
+* Model: kinematic bicycle with the steering angle as a state, so the inputs
+  are the road-wheel rate and the longitudinal acceleration, and the rate
+  limits form the input box. The pedal-to-acceleration map and the rolling
+  resistance come from the surrogate (braking as the torque balance of
+  `surrogate_dynamics.py`, traction capped by its drive force).
+* Barriers: the paper's heading-aligned ellipse as a high-order CBF with real
+  roots (p1 = p2 = sqrt(cbf_alpha)) and exact derivatives, the braking-distance
+  barrier of Ames et al. (TAC 2017) on lane obstacles with the margined
+  surrogate deceleration, and the same barrier at the sensing edge. Traffic
+  enters the derivatives at its measured velocity.
+* Observer: the disturbance observer of Alan et al. (L-CSS 2023) on the speed
+  channel, gain k with k dt = 0.5, whose error bound b/k tightens every row.
+* QP: weighted deviation from the command (the published threat weights) with
+  hard rows, solved exactly in two variables. Infeasible means full braking
+  with the steering held.
+* Teleop: the stale-command brake is a link watchdog, and a round-trip delay is
+  handled by predicting the state over it on the same model.
+
+What it drops from the published filter: the slack, the reactive-steering
+backup, the emergency predictor, the rear-approach guard, the speed-dependent
+radius inflation, the steering lag and slew applied after the QP, the terrain
+speed cap, and the dropping of receding barrier rows. With the published
+ellipse (w_long 0.06, bias 3.0) the ellipse is a long standoff, and on clay the
+QP turns infeasible once the vehicle has braked inside it, which brakes and
+holds: the published standoff behaviour, now explicit instead of absorbed by
+slack.
+
 ## `mpsf` — predictive filter
 
 `mpsf.py` solves a short-horizon optimal control problem with acados that keeps
@@ -199,8 +231,56 @@ heading-aligned corridor, ranked by how soon they are reached — and fills any
 remaining slots with the nearest of the rest. Clearance is reported over the
 whole obstacle field, not the selected subset.
 
-References: Wabersich & Zeilinger, *Automatica* 2021 (arXiv:1812.05506); Tearle
-et al., *IEEE RA-L* 2021 (arXiv:2102.11907).
+### Terminal-set formulation (`--mpsf-terminal-set`)
+
+The published formulation above stops the vehicle through the speed funnel,
+which ties the brake point to the horizon length (a 4 s horizon brakes about
+twice as far out as a 2 s one). The terminal-set formulation removes the
+funnel. Every executed command is certified by an explicit rollout: one filter
+period of the command, then straight braking to a stop at the margined
+surrogate deceleration (`--mpsf-brake-margin`, default 0.85), with the plant's
+pedal rate limit modelled. The rollout must keep the planning radius from every
+obstacle in the field and stay inside the sensed region (`--filter-sense-range`
+minus an unseen obstacle's footprint). The rollout runs to the stop, so safety
+does not depend on the horizon. The OCP, with its deviation cost on the first
+input and a terminal set from which straight braking stops clear, only proposes
+corrections when the command fails. Below 0.5 m/s an uncertified command is held
+at full straight braking. With the kinematic model a swerve is executed only if
+straight braking after it also certifies.
+
+### Predictive safety filter on the surrogate model (`--mpsf-dynamic`)
+
+The standard predictive safety filter (Wabersich and Zeilinger) on the tracking
+NMPC's own model, `surrogate_dynamics.py`: a dynamic bicycle whose lateral and
+yaw accelerations come from the rig surrogate's tire forces at each axle's slip
+angle, load (longitudinal and lateral transfer) and slip ratio. Braking is a
+torque balance on the surrogate's longitudinal curve. The pedal asks each wheel
+for pedal x 4000 N m / 0.467 m, and past the locked-wheel force the wheel locks
+and loses almost all cornering force (on clay above a pedal of about 0.22, as
+the plant does). The applied longitudinal acceleration follows the pedal with a
+0.1 s lag, which stands for the plant's pedal rate limit and brake build-up.
+
+* Cost: the published deviation from the operator's command on every stage.
+* Constraints: three footprint discs along the heading (radius 1.4 m, 1.3 m
+  behind and 1.2 m ahead of the CG) keep the planning radius plus an error tube
+  from every selected obstacle, and the path stays inside the sensed region less
+  the tube.
+* Terminal set: from the last state, straight braking at the margined surrogate
+  deceleration stops clear and inside the sensed region. This replaces the
+  speed funnel, so safety does not depend on the horizon length.
+* Execution: the plan is rolled out on the same model and every constraint is
+  checked without slack against the whole obstacle field. If it holds, the first
+  input is executed and the plan kept. Otherwise the next input of the last kept
+  plan is executed, which ends in straight full braking.
+
+The tube is the 0.25 m obstacle buffer plus 0.03 m per metre travelled plus 0.06
+x the integral over distance of the accumulated heading change (m rad). The OCP
+carries path length, accumulated turn and their integral as states, so it
+enforces the same tube. Against the plant (the journal workspace's
+`experiments/filter_fixes/model_check.py`, 12 open-loop manoeuvres on three
+soils at three speeds) the tube covers every checked point, for the CG and the
+discs. There, with the plant's speed imposed, the surrogate model's lateral
+error at 2 s on clay is 0.18 m where the kinematic model's is 1.08 m.
 
 ## Tire model supervision
 
@@ -293,3 +373,10 @@ Shared by both filters:
 | `w_progress` | 0.0 | Penalty on crawling below a 2 m/s floor; 0 keeps braking primary |
 | `max_decel` | 6.0 m/s² | Nominal braking envelope, scaled by the soil-derived braking authority |
 | `lat_accel_max_default` | 4.0 m/s² | Cornering limit used before a soil estimate arrives |
+| `terminal_set` | False | Terminal-set formulation (`--mpsf-terminal-set`) |
+| `time_steps` | 0.1 x 20 | Nonuniform horizon grid (`--mpsf-time-grid`, e.g. `0.1x10,0.3x10`) |
+| `brake_margin` | 0.85 | Fraction of the surrogate braking deceleration the certificate assumes |
+| `sense_range` | 30 m | Sensed region every certified path must stay inside (0 = none) |
+| `dynamic_model` | False | Predictive safety filter on the surrogate model (`--mpsf-dynamic`) |
+| `tube_c1`, `tube_eps` | 0.03, 0.06 | Error tube per metre travelled and per metre x radian turned |
+| `nominal_soil` | sand | Soil the dynamic model assumes before a belief arrives (soil-blind arm) |
