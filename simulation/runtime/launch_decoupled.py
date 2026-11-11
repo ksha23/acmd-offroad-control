@@ -470,6 +470,9 @@ Examples:
                         "accel/brake limits at n_hat - k*sigma_n (0 = off).")
     p.add_argument("--shield-terrain-nn", action="store_true",
                    help="Forwarded: filter NN queries conditioned on live terrain.")
+    p.add_argument("--shield-init-terrain-belief", type=str, default="",
+                   choices=["", "none", "match", "sand", "clay", "dirt"],
+                   help="Forwarded: the filters' soil belief (see chrono_sim_node).")
     p.add_argument("--shield-grip-scale", action="store_true",
                    help="Forwarded: filter authority scaled by the adapter's "
                         "measured grip ratio.")
@@ -635,6 +638,8 @@ Examples:
             sim_cmd.append("--shield-terrain-nn")
         if args.shield_grip_scale:
             sim_cmd.append("--shield-grip-scale")
+        if args.shield_init_terrain_belief:
+            sim_cmd.extend(["--shield-init-terrain-belief", args.shield_init_terrain_belief])
         if args.no_safety_nn:
             sim_cmd.append("--no-safety-nn")
         sim_cmd.extend(["--safety-buffer", str(args.safety_buffer)])
