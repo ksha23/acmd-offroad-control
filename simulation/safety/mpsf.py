@@ -373,7 +373,7 @@ class MPSFSafetyFilter:
                self.w_steer, self.w_alpha, self.w_terminal, self.w_progress, self.slack_lin,
                self.slack_quad, self.lat_accel_max_default)
         if self.terminal_set:
-            cfg = cfg + ("terminal_set_v1", self.time_steps, self.w_rest,
+            cfg = cfg + ("terminal_set_v2_ellipse", self.time_steps, self.w_rest,
                          self.brake_samples)
         return hashlib.sha1(repr(cfg).encode()).hexdigest()[:12]
 
@@ -424,6 +424,16 @@ class MPSFSafetyFilter:
         # The avoidance mode is thus set by the terrain, not by a fixed rule.
         a_lat = v ** 2 * ca.tan(delta) / self.L
         lat_h = [lat_accel_max - a_lat, lat_accel_max + a_lat]
+        if self.terminal_set:
+            # Friction ellipse: braking and cornering share one tire force
+            # budget. With the two limits applied separately, the plan could
+            # brake at the full soil deceleration while cornering at the full
+            # lateral limit, which the tires cannot deliver on low-grip soil,
+            # so a braking-and-swerving continuation looked feasible when it
+            # was not. Zero steering always satisfies the row.
+            a_lon = a_gain * a
+            a_lon_lim = brake_grip * self.max_decel
+            lat_h.append(1.0 - (a_lon / a_lon_lim) ** 2 - (a_lat / lat_accel_max) ** 2)
         if self.terminal_set:
             # Sensed region: a disc of the filter's sensing range around the
             # vehicle at solve time, shrunk by the footprint of an obstacle the
@@ -524,14 +534,15 @@ class MPSFSafetyFilter:
         no = self.n_obs
         n_sl = no + 1 if self.terminal_set else no          # slacked path rows
         n_e = (no * (1 + len(self.brake_samples)) + 1) if self.terminal_set else no
-        nh = n_sl + 2
+        n_lat = 3 if self.terminal_set else 2              # lateral rows (+ ellipse)
+        nh = n_sl + n_lat
         ocp.constraints.lh = np.zeros(nh)
         ocp.constraints.uh = 1e9 * np.ones(nh)
         ocp.constraints.lh_e = np.zeros(n_e)
         ocp.constraints.uh_e = 1e9 * np.ones(n_e)
         # stage 0: the two hard lateral-authority rows on the executed input.
-        ocp.constraints.lh_0 = np.zeros(2)
-        ocp.constraints.uh_0 = 1e9 * np.ones(2)
+        ocp.constraints.lh_0 = np.zeros(n_lat)
+        ocp.constraints.uh_0 = 1e9 * np.ones(n_lat)
         # slack ONLY the obstacle constraints (path + terminal) so the QP stays
         # feasible; the lateral rows are hard (braking is the feasible escape).
         ocp.constraints.idxsh = np.arange(n_sl)
@@ -698,6 +709,14 @@ class MPSFSafetyFilter:
         psi_mid = 0.5 * (psi + psi_next)
         return np.array([X + v_mid * np.cos(psi_mid) * h,
                          Y + v_mid * np.sin(psi_mid) * h, psi_next, v_next])
+
+    def _within_friction_ellipse(self, s_cmd, a_cmd, v, brake_grip) -> bool:
+        """The command's longitudinal and lateral demand fit the tire budget."""
+        a_gain = (self._accel_grip * self.max_accel if a_cmd >= 0.0
+                  else brake_grip * self.max_decel)
+        a_lon = a_gain * a_cmd / max(brake_grip * self.max_decel, 1e-6)
+        a_lat = v * v * np.tan(s_cmd * self.max_steer) / self.L / max(self._lat_accel_max, 1e-6)
+        return a_lon * a_lon + a_lat * a_lat <= 1.0 + 1e-6
 
     def _backup_rollout(self, z0, s0, a0, brake_grip):
         """The first input, then full braking with the wheels straight.
@@ -873,7 +892,8 @@ class MPSFSafetyFilter:
                 # and a longer horizon only gives (b) more continuations, so the
                 # set of accepted commands can only grow with the horizon.
                 bx, bu = self._backup_rollout(z0, s_op, a_op, brake_grip)
-                if self._path_is_clear(bx, obstacles):
+                if (self._within_friction_ellipse(s_op, a_op, z0[3], brake_grip)
+                        and self._path_is_clear(bx, obstacles)):
                     self._pass_count += 1
                     return _result(s_op, a_op, False)
                 for k in range(self.N + 1):
