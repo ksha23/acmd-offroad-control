@@ -473,6 +473,16 @@ Examples:
     p.add_argument("--shield-init-terrain-belief", type=str, default="",
                    choices=["", "none", "match", "sand", "clay", "dirt"],
                    help="Forwarded: the filters' soil belief (see chrono_sim_node).")
+    # Forwarded: the reformulated filters (see chrono_sim_node for each).
+    p.add_argument("--mpsf-terminal-set", action="store_true")
+    p.add_argument("--mpsf-time-grid", type=str, default="")
+    p.add_argument("--mpsf-w-rest", type=float, default=None)
+    p.add_argument("--mpsf-brake-margin", type=float, default=None)
+    p.add_argument("--cbf-braking-barrier", action="store_true")
+    p.add_argument("--cbf-brake-margin", type=float, default=None)
+    p.add_argument("--cbf-gamma-brake", type=float, default=None)
+    p.add_argument("--filter-sense-range", type=float, default=None)
+    p.add_argument("--safety-sim-clock", action="store_true")
     p.add_argument("--shield-grip-scale", action="store_true",
                    help="Forwarded: filter authority scaled by the adapter's "
                         "measured grip ratio.")
@@ -640,6 +650,14 @@ Examples:
             sim_cmd.append("--shield-grip-scale")
         if args.shield_init_terrain_belief:
             sim_cmd.extend(["--shield-init-terrain-belief", args.shield_init_terrain_belief])
+        for flag in ("mpsf_terminal_set", "cbf_braking_barrier", "safety_sim_clock"):
+            if getattr(args, flag):
+                sim_cmd.append("--" + flag.replace("_", "-"))
+        for flag in ("mpsf_time_grid", "mpsf_w_rest", "mpsf_brake_margin", "cbf_brake_margin",
+                     "cbf_gamma_brake", "filter_sense_range"):
+            value = getattr(args, flag)
+            if value not in (None, ""):
+                sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])
         if args.no_safety_nn:
             sim_cmd.append("--no-safety-nn")
         sim_cmd.extend(["--safety-buffer", str(args.safety_buffer)])
