@@ -66,6 +66,13 @@ def make_safety_filter(flavor: str,
     """
     f = (flavor or '').lower()
     if f in ('dob_cbf', 'cbf', 'legacy', 'dob-cbf'):
+        if flavor_kwargs.pop('theory', False):
+            # The textbook DOB-CBF (dob_cbf_theory.py); the published one is
+            # the default and stays unchanged for reproduction.
+            from .dob_cbf_theory import TheoryCBFSafetyFilter
+            return TheoryCBFSafetyFilter(vehicle_params=vehicle_params,
+                                         nn_casadi=nn_model,
+                                         **flavor_kwargs)
         return CBFSafetyFilter(vehicle_params=vehicle_params,
                                nn_casadi=nn_model,
                                **flavor_kwargs)
