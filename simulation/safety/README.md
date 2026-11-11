@@ -260,18 +260,27 @@ and loses almost all cornering force (on clay above a pedal of about 0.22, as
 the plant does). The applied longitudinal acceleration follows the pedal with a
 0.1 s lag, which stands for the plant's pedal rate limit and brake build-up.
 
-* Cost: the published deviation from the operator's command on every stage.
+* Cost: deviation from the operator's command on the first input only, the
+  textbook filter (`--mpsf-psf-cost first`, the default). The later inputs carry
+  a 1e-4 regularization. `horizon` charges deviation on every planned stage, as
+  the published MPSF does.
 * Constraints: three footprint discs along the heading (radius 1.4 m, 1.3 m
   behind and 1.2 m ahead of the CG) keep the planning radius plus an error tube
-  from every selected obstacle, and the path stays inside the sensed region less
-  the tube.
-* Terminal set: from the last state, straight braking at the margined surrogate
-  deceleration stops clear and inside the sensed region. This replaces the
-  speed funnel, so safety does not depend on the horizon length.
+  from every selected obstacle, at every place a vehicle among them can be by
+  then (below), and the path stays inside the sensed region less the tube.
+* Terminal set: the planned stages are followed by 22 stages of 0.2 s with the
+  input fixed to straight full braking, and the vehicle must be below 0.3 m/s at
+  the end, clear and inside the sensed region. This replaces the speed funnel,
+  so safety does not depend on the horizon length.
 * Execution: the plan is rolled out on the same model and every constraint is
   checked without slack against the whole obstacle field. If it holds, the first
   input is executed and the plan kept. Otherwise the next input of the last kept
   plan is executed, which ends in straight full braking.
+* No delay advance. The filter runs on the vehicle, so its command acts at once,
+  and it solves from the measured state. The published MPSF advances its state
+  over the command round trip (up to 0.5 s). A plan checked from that advanced
+  state and then run from the real one is not the plan that was checked, and in
+  the failure-mode battery that let the vehicle stop against a rock.
 
 The tube is the 0.25 m obstacle buffer plus 0.03 m per metre travelled plus 0.06
 x the integral over distance of the accumulated heading change (m rad). The OCP
@@ -281,6 +290,18 @@ enforces the same tube. Against the plant (the journal workspace's
 soils at three speeds) the tube covers every checked point, for the CG and the
 discs. There, with the plant's speed imposed, the surrogate model's lateral
 error at 2 s on clay is 0.18 m where the kinematic model's is 1.08 m.
+
+Other vehicles are predicted as sets. Each keeps its measured heading, and its
+speed can do anything between braking as hard as the soil allows (locked wheels
+on the believed soil, which is how the plant's vehicles brake at full pedal) and
+speeding up at 1 m/s^2 (`traffic_accel`), starting from the measured speed give
+or take `traffic_speed_err`. At each future time the vehicle is then somewhere
+on a segment along its heading, and the discs must clear the whole segment, in
+the OCP and in the check. A lead vehicle that brakes, an oncoming one and one
+cutting in are all inside the set, so the kept plan stays safe while they move.
+`--traffic-speed-noise s`
+adds a Gaussian error of standard deviation s to each vehicle's speed as both
+filters receive it, and sets `traffic_speed_err` to 3 s.
 
 ## Tire model supervision
 
@@ -379,4 +400,5 @@ Shared by both filters:
 | `sense_range` | 30 m | Sensed region every certified path must stay inside (0 = none) |
 | `dynamic_model` | False | Predictive safety filter on the surrogate model (`--mpsf-dynamic`) |
 | `tube_c1`, `tube_eps` | 0.03, 0.06 | Error tube per metre travelled and per metre x radian turned |
+| `traffic_speed_err`, `traffic_accel` | 0, 1.0 | Other vehicles' speed error bound (m/s) and acceleration bound (m/s^2) in the dynamic model's prediction |
 | `nominal_soil` | sand | Soil the dynamic model assumes before a belief arrives (soil-blind arm) |

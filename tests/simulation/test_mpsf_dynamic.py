@@ -104,6 +104,21 @@ def test_clear_road_passes_unchanged(clay_filter):
     assert r.throttle == pytest.approx(0.4, abs=0.01)
 
 
+def test_plans_from_the_measured_state_under_delay(clay_filter):
+    # The filter acts on the vehicle, so a command delay must not move the
+    # state it plans and checks from.
+    seen = []
+    check = clay_filter._check
+    clay_filter._check = lambda z0, plan, obs: seen.append(z0.copy()) or check(z0, plan, obs)
+    try:
+        clay_filter.set_teleop_delay(0.3)
+        clay_filter.filter(0.0, 0.4, 0.0, _state(0.0, 6.0), [])
+    finally:
+        clay_filter.set_teleop_delay(0.0)
+        del clay_filter._check
+    assert seen and seen[0][0] == 0.0 and seen[0][3] == 6.0
+
+
 def test_wall_too_close_to_pass(clay_filter):
     # A wall across the lane 12 m ahead at 8 m/s on clay: stopping takes about
     # 13.6 m, and no swerve gets around a wall, so full throttle cannot pass.
@@ -129,3 +144,20 @@ def test_check_predicts_oncoming_traffic():
     plan = [(0.0, 0.0)] * f.N
     assert f._check(z0, plan, [(30.0, 0.0, 1.2, True)])
     assert not f._check(z0, plan, [(30.0, 0.0, 1.2, True, -8.0, 0.0)])
+
+
+def test_check_predicts_lead_braking():
+    # Following a vehicle 14 m ahead at the same 6 m/s on dirt. Coasting for
+    # the planned 2 s and then braking is clear if the lead holds its speed,
+    # not if it brakes as hard as the soil allows. Braking now stops clear.
+    try:
+        f = MPSFSafetyFilter(vehicle_params=VP, dynamic_model=True, nn_model_dir=MODEL_DIR,
+                             sense_range=0, build_solver=False)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"surrogate unavailable: {e}")
+    f.update_terrain(_soil("dirt"), use_terrain_nn=True)
+    f._last_sense = (0.0, 0.0, 1.0e4, 2.0)
+    z0 = np.array([0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0])
+    lead = [(14.0, 0.0, 1.2, True, 6.0, 0.0, 0.0)]
+    assert not f._check(z0, [(0.0, 0.0)] * f.N, lead)
+    assert f._check(z0, [(0.0, -1.0)] * f.N, lead)

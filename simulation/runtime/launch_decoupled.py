@@ -482,6 +482,7 @@ Examples:
     p.add_argument("--mpsf-brake-margin", type=float, default=None)
     p.add_argument("--cbf-braking-barrier", action="store_true")
     p.add_argument("--cbf-theory", action="store_true")
+    p.add_argument("--traffic-speed-noise", type=float, default=None)
     p.add_argument("--cbf-brake-margin", type=float, default=None)
     p.add_argument("--cbf-gamma-brake", type=float, default=None)
     p.add_argument("--filter-sense-range", type=float, default=None)
@@ -659,7 +660,7 @@ Examples:
                 sim_cmd.append("--" + flag.replace("_", "-"))
         for flag in ("mpsf_time_grid", "mpsf_psf_cost", "mpsf_w_rest", "mpsf_brake_margin",
                      "cbf_brake_margin",
-                     "cbf_gamma_brake", "filter_sense_range"):
+                     "cbf_gamma_brake", "filter_sense_range", "traffic_speed_noise"):
             value = getattr(args, flag)
             if value not in (None, ""):
                 sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])

@@ -966,6 +966,11 @@ def run_sim_node(args):
         _detail = args.traffic_detail if any_vis else "none"
         traffic_mgr.build(system, terrain, detail=_detail)
         print(f"  Convoy '{args.convoy}': {len(traffic_mgr.vehicles)} traffic vehicles")
+    # Speed error of the traffic measurement handed to the safety filter: one
+    # Gaussian draw per vehicle per filter step, from its own stream so the
+    # arms of a cell see the same errors.
+    traffic_noise_rng = np.random.default_rng(
+        [args.sim_seed if args.sim_seed is not None else 0, 7531])
 
     # --- Goal gate (visible finish line; round ends early on reaching it) ---
     if args.goal_distance > 0 and any_vis:
@@ -1080,6 +1085,9 @@ def run_sim_node(args):
                      "terminal_set": bool(args.mpsf_terminal_set),
                      "dynamic_model": bool(args.mpsf_dynamic),
                      "psf_cost": str(args.mpsf_psf_cost),
+                     # The prediction of other vehicles allows three standard
+                     # deviations of the speed measurement's error.
+                     "traffic_speed_err": 3.0 * float(args.traffic_speed_noise),
                      "w_rest": float(args.mpsf_w_rest),
                      "brake_margin": float(args.mpsf_brake_margin),
                      "time_steps": _parse_time_grid(args.mpsf_time_grid)}
@@ -1116,7 +1124,8 @@ def run_sim_node(args):
               f"mpsf_psf_cost={args.mpsf_psf_cost} "
               f"mpsf_grid={args.mpsf_time_grid or '0.1x20'} "
               f"cbf_braking_barrier={bool(args.cbf_braking_barrier)} "
-              f"cbf_theory={bool(args.cbf_theory)}", flush=True)
+              f"cbf_theory={bool(args.cbf_theory)} "
+              f"traffic_speed_noise={args.traffic_speed_noise}", flush=True)
         if args.safety_sim_clock and hasattr(safety_filter, "set_clock"):
             safety_filter.set_clock(lambda: _sim_clock[0])
 
@@ -1785,13 +1794,18 @@ def run_sim_node(args):
             if traffic_mgr is not None:
                 for st in traffic_mgr.states():
                     ox, oy, orad = st["x"], st["y"], st["r"]
+                    speed = st["speed"]
+                    if args.traffic_speed_noise > 0.0:
+                        speed += traffic_noise_rng.normal(0.0, args.traffic_speed_noise)
                     if (ox - veh_pos.x) ** 2 + (oy - veh_pos.y) ** 2 < float(args.filter_sense_range) ** 2:
                         # 4th element True => vehicle (CBF weights braking equally).
-                        # 5th and 6th: its planar velocity, which the filters that
-                        # predict obstacle motion read and the published ones ignore.
+                        # 5th and 6th: its measured planar velocity, 7th its
+                        # heading. The filters that predict obstacle motion read
+                        # them and the published ones ignore them.
                         all_obstacles.append((ox, oy, orad, True,
-                                              st["speed"] * np.cos(st["psi"]),
-                                              st["speed"] * np.sin(st["psi"])))
+                                              speed * np.cos(st["psi"]),
+                                              speed * np.sin(st["psi"]),
+                                              st["psi"]))
 
             veh_state = {
                 'x': veh_pos.x, 'y': veh_pos.y, 'psi': veh_psi,
@@ -2594,6 +2608,12 @@ def main():
                    help="MPSF terminal set only: fraction of the surrogate's peak "
                         "braking deceleration the plan may use. The plant reaches "
                         "87 to 94 percent of it under full brake.")
+    p.add_argument("--traffic-speed-noise", type=float, default=0.0,
+                   help="Standard deviation (m/s) of the Gaussian error on each "
+                        "traffic vehicle's speed as the safety filter receives it, "
+                        "drawn per vehicle per filter step. The dynamic-model MPSF "
+                        "predicts other vehicles with three of these as its speed "
+                        "error bound. 0 (default) gives the filter the true speed.")
     p.add_argument("--cbf-theory", action="store_true",
                    help="DOB-CBF only: the textbook DOB-CBF (simulation/safety/"
                         "dob_cbf_theory.py): high-order CBF on the ellipse with real "

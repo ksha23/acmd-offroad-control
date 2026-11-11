@@ -118,6 +118,8 @@ class MPSFSafetyFilter:
                  psf_lm: float = 0.01,
                  psf_w_rest: float = 1e-4,
                  psf_globalization: str = "FIXED_STEP",
+                 traffic_speed_err: float = 0.0,
+                 traffic_accel: float = 1.0,
                  build_solver: bool = True,
                  **_ignored):
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
@@ -157,6 +159,14 @@ class MPSFSafetyFilter:
         # Margin between the OCP, which constrains the stage nodes, and the
         # check of its plan, which tests every integration substep (m).
         self.ocp_margin = 0.1
+        # Prediction of other vehicles (set-based). Each keeps its measured
+        # heading, and its speed can do anything between braking as hard as
+        # the soil allows and speeding up at traffic_accel, starting from the
+        # measured speed give or take traffic_speed_err. At each future time
+        # it is then somewhere on a segment along its heading, and every
+        # footprint disc must clear that whole segment.
+        self.traffic_speed_err = float(traffic_speed_err)
+        self.traffic_accel = float(traffic_accel)
         # Terminal set by construction: after the planned stages the OCP carries
         # a tail of stages whose input is fixed to the backup, straight full
         # braking, and the last state must be stopped. The terminal set is then
@@ -240,12 +250,15 @@ class MPSFSafetyFilter:
         self.nx = 10 if self.dynamic_model else 4
         self.nu = 2  # [steer, alpha]
         # params: [s_op, a_op, accel_grip, brake_grip, lat_accel_max,
-        #          (ox, oy, orad)*n_obs]. Braking and cornering authority are
+        #          (ox, oy, orad)*n_obs], or in the dynamic model the segment
+        #          a vehicle can be on at that stage, (ax, ay, bx, by, orad)*n_obs.
+        #          Braking and cornering authority are
         # separate parameters so the tire surrogate sets the stopping and
         # turning capability the soil actually supports; the filter's avoidance
         # mode -- brake or steer -- then follows from those limits rather than
         # from a fixed preference.
-        self._np = 5 + 3 * self.n_obs
+        self._po = 5 if self.dynamic_model else 3
+        self._np = 5 + self._po * self.n_obs
         if self.terminal_set or self.dynamic_model:
             # + [sense centre x, y, effective sensed radius, terminal braking decel]
             self._np += 4
@@ -257,7 +270,6 @@ class MPSFSafetyFilter:
         self._bike = None
         self._dyn_soil = None
         self._ax_app = 0.0          # applied longitudinal acceleration (model state)
-        self._last_exec = (0.0, 0.0)
         self._backup = None         # the last checked plan's remaining substep commands
         self._sol = None            # last solution, for the warm start
         self._verified_count = 0
@@ -507,7 +519,7 @@ class MPSFSafetyFilter:
         if self.dynamic_model:
             from . import surrogate_dynamics as sd
             b = self._bike
-            cfg = cfg + ("psf_dynamic_v6", self.psf_cost, self.psf_lm, self.psf_w_rest, self.psf_rk_steps, self.psf_max_iter,
+            cfg = cfg + ("psf_dynamic_v7_segments", self.psf_cost, self.psf_lm, self.psf_w_rest, self.psf_rk_steps, self.psf_max_iter,
                          self.psf_globalization, self.time_steps, self._tail_steps, self.stop_speed,
                          self.disc_offsets,
                          self.disc_radius, self.ocp_margin, self.tube_c1, self.tube_eps,
@@ -538,7 +550,7 @@ class MPSFSafetyFilter:
         X, Y, psi, uu, r = x[0], x[1], x[2], x[3], x[5]
         s_len, turned, S = x[7], x[8], x[9]
         st, al = u[0], u[1]
-        q = 5 + 3 * self.n_obs
+        q = 5 + self._po * self.n_obs
         cx, cy, r_eff, a_term = p[q], p[q + 1], p[q + 2], p[q + 3]
         terrain = p[q + 4:q + 10]
         curve = p[q + 10:q + 10 + N_CURVE]
@@ -558,12 +570,17 @@ class MPSFSafetyFilter:
         hx, hy = ca.cos(psi), ca.sin(psi)
 
         def clear_rows(px, py, tube):
+            # Squared distance from each disc centre to the obstacle's segment,
+            # less the clearance radius squared. A rock's segment is one point.
             rows = []
             for j in range(self.n_obs):
-                ox, oy, orad = p[5 + 3 * j], p[6 + 3 * j], p[7 + 3 * j]
+                ax, ay, bx, by, orad = (p[5 + 5 * j + i] for i in range(5))
+                dx, dy = bx - ax, by - ay
                 radius = orad + self.disc_radius + self.obstacle_buffer + self.ocp_margin + tube
                 for off in self.disc_offsets:
-                    rows.append((px + off * hx - ox) ** 2 + (py + off * hy - oy) ** 2 - radius ** 2)
+                    qx, qy = px + off * hx - ax, py + off * hy - ay
+                    w = ca.fmin(ca.fmax((qx * dx + qy * dy) / (dx * dx + dy * dy + 1e-6), 0.0), 1.0)
+                    rows.append((qx - w * dx) ** 2 + (qy - w * dy) ** 2 - radius ** 2)
             return rows
 
         tube = self.tube_c1 * s_len + self.tube_eps * S
@@ -1040,6 +1057,41 @@ class MPSFSafetyFilter:
         return max(self.sense_range - margin, 1.0)
 
     # -- dynamic model: the predictive safety filter step -----------------------
+    def _traffic_decel(self) -> float:
+        """Hardest braking assumed for another vehicle: locked wheels on the
+        believed soil, which is how the plant's vehicles brake at full pedal."""
+        return max(self._bike.peak_decel(), 0.5)
+
+    def _segment(self, o, t):
+        """Ends (ax, ay), (bx, by) of the segment an obstacle can be on at each
+        time t (s after its measurement). A rock, or an obstacle given without
+        a velocity, stays where it is."""
+        t = np.asarray(t, dtype=float)
+        ox, oy = float(o[0]), float(o[1])
+        if len(o) < 6:
+            x0, y0 = np.full_like(t, ox), np.full_like(t, oy)
+            return x0, y0, x0, y0
+        vx, vy = float(o[4]), float(o[5])
+        if len(o) >= 7:
+            # Heading given: the speed is the velocity along it, which a noisy
+            # measurement can make negative.
+            hx, hy = np.cos(float(o[6])), np.sin(float(o[6]))
+            speed = vx * hx + vy * hy
+        else:
+            speed = float(np.hypot(vx, vy))
+            if speed < 1e-9:
+                x0, y0 = np.full_like(t, ox), np.full_like(t, oy)
+                return x0, y0, x0, y0
+            hx, hy = vx / speed, vy / speed
+        v_lo = max(speed - self.traffic_speed_err, 0.0)
+        v_hi = max(speed + self.traffic_speed_err, 0.0)
+        a_b = self._traffic_decel()
+        # Slowest: brake from v_lo to a stop and stay there.
+        d_lo = np.where(t < v_lo / a_b, v_lo * t - 0.5 * a_b * t * t, 0.5 * v_lo * v_lo / a_b)
+        # Fastest: speed up from v_hi.
+        d_hi = v_hi * t + 0.5 * self.traffic_accel * t * t
+        return ox + d_lo * hx, oy + d_lo * hy, ox + d_hi * hx, oy + d_hi * hy
+
     def _check(self, z0, plan, obstacles):
         """Roll the plan out on the model with the OCP's own integrator, then
         straight full braking to a stop, and test every constraint of the OCP
@@ -1061,13 +1113,13 @@ class MPSFSafetyFilter:
             return False
         for o in obstacles or ():
             radius = float(o[2]) + self.disc_radius + self.obstacle_buffer
-            # A moving obstacle (traffic) at constant velocity.
-            vx, vy = (float(o[4]), float(o[5])) if len(o) >= 6 else (0.0, 0.0)
-            ox = float(o[0]) + vx * t
-            oy = float(o[1]) + vy * t
+            ax, ay, bx, by = self._segment(o, t)
+            dx, dy = bx - ax, by - ay
             for off in self.disc_offsets:
-                d = np.hypot(P[:, 0] + off * np.cos(psi) - ox, P[:, 1] + off * np.sin(psi) - oy)
-                if np.any(d < radius + tube):
+                qx = P[:, 0] + off * np.cos(psi) - ax
+                qy = P[:, 1] + off * np.sin(psi) - ay
+                w = np.clip((qx * dx + qy * dy) / (dx * dx + dy * dy + 1e-6), 0.0, 1.0)
+                if np.any(np.hypot(qx - w * dx, qy - w * dy) < radius + tube):
                     return False
         return True
 
@@ -1103,41 +1155,36 @@ class MPSFSafetyFilter:
         braking tail, out on the same model. If every constraint holds without
         slack, execute the first input and keep the plan. Otherwise execute the
         next input of the last kept plan, which ends in straight full braking.
+
+        The filter runs on the vehicle, so its command acts at once and there is
+        no advance over the command round trip (the published MPSF has one). A
+        plan checked from an advanced state and run from the measured one is not
+        the plan that was checked.
         """
         u0 = min(max(float(vehicle_state.get("u", 0.0)), 0.0), self.max_speed)
         z0 = np.array([float(vehicle_state["x"]), float(vehicle_state["y"]),
                        float(vehicle_state["psi"]), u0,
                        float(vehicle_state.get("v", 0.0)), float(vehicle_state.get("omega", 0.0)),
                        self._ax_app])
-        accel = self._accel_grip * self.max_accel
-        if self._teleop_delay > 0.0:
-            # Advance over the command round trip with the command in effect.
-            adv = min(2.0 * self._teleop_delay, 0.5)
-            n_adv = max(1, int(round(adv / self.cert_dt)))
-            xs = self._bike.rollout_rk4(z0, np.array([self._last_exec] * n_adv),
-                                        np.full(n_adv, adv / n_adv), self.cert_dt, accel,
-                                        self.brake_margin, 0.0)
-            z0 = xs[-1].copy()
         r_eff = self._sensed_radius()
         a_term = max(self.brake_margin * self._bike.peak_decel(), 0.5)
         self._last_sense = (x_sense, y_sense, r_eff, a_term)
 
         obs = self._select_obstacles(z0[0], z0[1], z0[2], obstacles)
-        velocity = {(float(o[0]), float(o[1])): ((float(o[4]), float(o[5])) if len(o) >= 6 else (0.0, 0.0))
-                    for o in obstacles or ()}
-        obs = [(o[0], o[1], o[2]) + velocity.get((o[0], o[1]), (0.0, 0.0)) for o in obs]
+        full = {(float(o[0]), float(o[1])): o for o in obstacles or ()}
+        obs = [full.get((o[0], o[1]), o) for o in obs]
         while len(obs) < self.n_obs:
-            obs.append((z0[0] + 1e4, z0[1] + 1e4, 0.1, 0.0, 0.0))
+            obs.append((z0[0] + 1e4, z0[1] + 1e4, 0.1))
         tail = ([x_sense, y_sense, r_eff, a_term]
                 + list(self._bike.terrain_vec) + list(self._bike.curve))
         steps = self._psf_steps()
         n_total = len(steps)
         t_nodes = np.concatenate([[0.0], np.cumsum(steps)])
+        # Each obstacle's segment at every node, as columns (ax, ay, bx, by).
+        segs = [np.stack(self._segment(o, t_nodes), axis=1) for o in obs]
 
         def stage_p(k):
-            # Obstacles at their predicted positions at node k (constant velocity).
-            o_k = [c for (ox, oy, r, vx, vy) in obs
-                   for c in (ox + vx * t_nodes[k], oy + vy * t_nodes[k], r)]
+            o_k = [c for o, sg in zip(obs, segs) for c in (*sg[k], float(o[2]))]
             head = [s_op, a_op] if k < self.N else [0.0, -1.0]   # the tail's input is fixed
             return np.array(head + [self._accel_grip, self._brake_grip, self._lat_accel_max]
                             + o_k + tail, dtype=float)
@@ -1224,7 +1271,6 @@ class MPSFSafetyFilter:
                                                   self.brake_margin)
                 lag = 1.0 - np.exp(-self.time_steps[0] / self._bike.tau_long)
                 self._ax_app += lag * (target - self._ax_app)
-                self._last_exec = (s_c, a_c)
             tol = self.psf_change_tol if self.dynamic_model else 1e-3
             modified = bool(modified or abs(s_c - s_op) > tol)
             if modified:
