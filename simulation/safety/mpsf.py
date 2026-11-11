@@ -47,6 +47,7 @@ import numpy as np
 import casadi as ca
 
 from . import SafetyFilterResult
+from .authority import peak_braking_decel, peak_lateral_accel
 
 _ACADOS_BUILD_ROOT = Path(
     os.environ.get("MPSF_BUILD_ROOT",
@@ -100,11 +101,37 @@ class MPSFSafetyFilter:
                  nn_model_dir: str = "nn_models/tire_force_static",
                  stale_cmd_timeout: float = 2.0,
                  teleop_delay: float = 0.0,
+                 terminal_set: bool = False,
+                 sense_range: float = 30.0,
+                 unseen_obstacle_radius: float = 1.0,
+                 brake_margin: float = 0.85,
+                 w_rest: float = 0.01,
+                 time_steps=None,
                  build_solver: bool = True,
                  **_ignored):
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
-        self.N = int(horizon)
-        self.dt = float(dt)
+        # Formulation switch. False keeps the published filter: deviation cost
+        # on every stage and a per-stage speed funnel tied to the horizon
+        # length. True selects the terminal-set filter: the plan must end in a
+        # state from which straight-line braking stops clear of every known
+        # obstacle and inside the sensed region, the deviation cost sits on the
+        # executed (first) input, and there is no speed funnel. Its safety does
+        # not depend on the horizon length, and a longer horizon only enlarges
+        # the set of commands it can accept.
+        self.terminal_set = bool(terminal_set)
+        self.sense_range = float(sense_range) if sense_range else 0.0
+        self.unseen_obstacle_radius = float(unseen_obstacle_radius)
+        self.brake_margin = float(brake_margin)
+        self.w_rest = float(w_rest)
+        self.brake_samples = (0.5, 1.0)
+        if time_steps:
+            self.time_steps = tuple(float(t) for t in time_steps)
+            self.N = len(self.time_steps)
+            self.dt = self.time_steps[0]
+        else:
+            self.N = int(horizon)
+            self.dt = float(dt)
+            self.time_steps = tuple([self.dt] * self.N)
         self.n_obs = int(n_obstacles)
         self.obstacle_buffer = float(obstacle_buffer)
         self.vehicle_radius = float(vehicle_radius)
@@ -141,9 +168,14 @@ class MPSFSafetyFilter:
         # mode -- brake or steer -- then follows from those limits rather than
         # from a fixed preference.
         self._np = 5 + 3 * self.n_obs
+        if self.terminal_set:
+            # + [sense centre x, y, effective sensed radius, terminal braking decel]
+            self._np += 4
 
         self._teleop_delay = max(float(teleop_delay), 0.0)
-        self._last_cmd_wall = None  # wall-clock arrival of the latest command
+        self._last_cmd_wall = None  # arrival of the latest command, on self._clock
+        self._clock = time.time     # set_clock() swaps in simulation time
+        self._last_sense = None
         self._grip = 1.0          # traction/accel grip (kept as external alias)
         self._accel_grip = 1.0
         self._brake_grip = 1.0    # 1.0 => full max_decel (soil-blind default)
@@ -166,6 +198,10 @@ class MPSFSafetyFilter:
         self._filter_count = 0
         self._modify_count = 0
         self._fail_stop_count = 0   # accepted solve whose plan was still unsafe
+        self._solve_fail_count = 0  # solver status outside {0, 2}: fail-closed brake
+        self._pass_count = 0        # terminal set: operator command certified as is
+        self._ocp_pass_count = 0    # of those, certified by the OCP, not the backup
+        self.slack_tol = 1.0e-3     # m^2, slack above this means no safe continuation
         self._lat_clamp_count = 0   # executed steering clamped to soil authority
         self._stale_brake_count = 0
         self._solve_ms_ema = 0.0
@@ -173,6 +209,14 @@ class MPSFSafetyFilter:
             self._build_solver()
 
     # -- interface parity with CBFSafetyFilter ---------------------------------
+    def set_clock(self, clock):
+        """Use ``clock()`` (seconds) instead of wall time for command ages.
+
+        The plant node passes simulation time, which makes the stale-command
+        brake independent of how fast the machine runs the simulation.
+        """
+        self._clock = clock
+
     def set_teleop_delay(self, delay_s: float):
         self._teleop_delay = max(float(delay_s), 0.0)
 
@@ -183,13 +227,13 @@ class MPSFSafetyFilter:
         commands must not leave the last command latched -- ``filter`` brakes
         once no command has arrived within ``stale_cmd_timeout``.
         """
-        self._last_cmd_wall = time.time()
+        self._last_cmd_wall = self._clock()
 
     def _is_command_stale(self) -> bool:
         """True if no command received within stale_cmd_timeout (teleop only)."""
         if self._teleop_delay <= 0.0 or self._last_cmd_wall is None:
             return False
-        return (time.time() - self._last_cmd_wall) > self.stale_cmd_timeout
+        return (self._clock() - self._last_cmd_wall) > self.stale_cmd_timeout
 
     def update_terrain(self, terrain_params, phi_uncertainty_deg=None, n_sigma=None,
                        hedge_k=None, use_terrain_nn=None, grip_scale=None,
@@ -251,20 +295,7 @@ class MPSFSafetyFilter:
             if self._nn is None:
                 load_nn_tire_model = _nn_loader()
                 self._nn = load_nn_tire_model(self.nn_model_dir, terrain)
-            nn = self._nn
-            best = 0.0
-            for slip in np.linspace(0.02, 0.5, 30):   # slip angle sweep (rad)
-                fy_f = nn.predict_numeric(float(slip), self._fz_f, 5.0, kappa=0.0,
-                                          n_terrain=n, terrain_params=terrain,
-                                          rates=np.zeros(3))[1]
-                fy_r = nn.predict_numeric(float(slip), self._fz_r, 5.0, kappa=0.0,
-                                          n_terrain=n, terrain_params=terrain,
-                                          rates=np.zeros(3))[1]
-                if not (np.isfinite(fy_f) and np.isfinite(fy_r)):
-                    continue
-                lat = (2.0 * abs(fy_f) + 2.0 * abs(fy_r)) / self._mass
-                if lat > best:
-                    best = lat
+            best = peak_lateral_accel(self._nn, terrain, self._fz_f, self._fz_r, self._mass)
             if best <= 0.0:
                 return None
             # A margin keeps the planned turn inside the achievable envelope.
@@ -287,20 +318,7 @@ class MPSFSafetyFilter:
             if self._nn is None:
                 load_nn_tire_model = _nn_loader()
                 self._nn = load_nn_tire_model(self.nn_model_dir, terrain)
-            nn = self._nn
-            best = 0.0
-            for kappa in np.linspace(-0.9, -0.02, 30):
-                fx_f, _ = nn.predict_numeric(0.0, self._fz_f, 5.0, kappa=float(kappa),
-                                             n_terrain=n, terrain_params=terrain,
-                                             rates=np.zeros(3))
-                fx_r, _ = nn.predict_numeric(0.0, self._fz_r, 5.0, kappa=float(kappa),
-                                             n_terrain=n, terrain_params=terrain,
-                                             rates=np.zeros(3))
-                if not (np.isfinite(fx_f) and np.isfinite(fx_r)):
-                    continue
-                decel = (2.0 * abs(fx_f) + 2.0 * abs(fx_r)) / self._mass
-                if decel > best:
-                    best = decel
+            best = peak_braking_decel(self._nn, terrain, self._fz_f, self._fz_r, self._mass)
             if best <= 0.0:
                 return None
             self._nn_soil_key = soil_key
@@ -339,6 +357,11 @@ class MPSFSafetyFilter:
                     self.nn_brake_authority and self._use_terrain_nn
                     and not self._nn_load_failed),
                 "fail_stops": self._fail_stop_count,
+                "solve_fails": self._solve_fail_count,
+                "certified_passes": self._pass_count,
+                "ocp_certified_passes": self._ocp_pass_count,
+                "terminal_set": self.terminal_set,
+                "horizon_s": float(sum(self.time_steps)),
                 "lat_clamps": self._lat_clamp_count,
                 "stale_brakes": self._stale_brake_count}
 
@@ -349,6 +372,9 @@ class MPSFSafetyFilter:
                self.max_decel, self.max_steer, self.v_terminal, self.max_speed,
                self.w_steer, self.w_alpha, self.w_terminal, self.w_progress, self.slack_lin,
                self.slack_quad, self.lat_accel_max_default)
+        if self.terminal_set:
+            cfg = cfg + ("terminal_set_v1", self.time_steps, self.w_rest,
+                         self.brake_samples)
         return hashlib.sha1(repr(cfg).encode()).hexdigest()[:12]
 
     def _build_model(self):
@@ -398,8 +424,36 @@ class MPSFSafetyFilter:
         # The avoidance mode is thus set by the terrain, not by a fixed rule.
         a_lat = v ** 2 * ca.tan(delta) / self.L
         lat_h = [lat_accel_max - a_lat, lat_accel_max + a_lat]
-        model.con_h_expr = ca.vertcat(*obs_h, *lat_h)   # path: obstacles + lateral
-        model.con_h_expr_e = ca.vertcat(*obs_h)          # terminal: obstacles only
+        if self.terminal_set:
+            # Sensed region: a disc of the filter's sensing range around the
+            # vehicle at solve time, shrunk by the footprint of an obstacle the
+            # filter cannot yet see. Every planned position must stay inside it.
+            q = 5 + 3 * self.n_obs
+            cx, cy, r_eff, a_term = p[q], p[q + 1], p[q + 2], p[q + 3]
+            sense_h = r_eff ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2)
+            model.con_h_expr = ca.vertcat(*obs_h, sense_h, *lat_h)
+            # Terminal set: from the last planned state, braking straight ahead
+            # at the soil's (margined) deceleration must stop clear of every
+            # known obstacle and inside the sensed region. Points along the
+            # braking segment are checked against each obstacle. This set is
+            # invariant under full braking, so a plan that ends in it can always
+            # be continued, which is what makes safety independent of N.
+            l_brk = v ** 2 / (2.0 * a_term)
+            hx, hy = ca.cos(psi), ca.sin(psi)
+            term = list(obs_h)
+            for sig in self.brake_samples:
+                px, py = X + sig * l_brk * hx, Y + sig * l_brk * hy
+                for j in range(self.n_obs):
+                    ox, oy, orad = p[5 + 3 * j], p[6 + 3 * j], p[7 + 3 * j]
+                    safe_r = (orad + self.vehicle_radius + self.ego_forward_extent
+                              + self.obstacle_buffer)
+                    term.append((px - ox) ** 2 + (py - oy) ** 2 - safe_r ** 2)
+            term.append(r_eff ** 2 - ((X + l_brk * hx - cx) ** 2
+                                      + (Y + l_brk * hy - cy) ** 2))
+            model.con_h_expr_e = ca.vertcat(*term)
+        else:
+            model.con_h_expr = ca.vertcat(*obs_h, *lat_h)   # path: obstacles + lateral
+            model.con_h_expr_e = ca.vertcat(*obs_h)          # terminal: obstacles only
         # Stage 0 carries the lateral rows alone. Without an explicit stage-0
         # constraint set, acados leaves the first stage unconstrained, and the
         # first stage's input is the one the vehicle executes -- the solver
@@ -421,10 +475,18 @@ class MPSFSafetyFilter:
         # exists. Setting w_progress to 0 makes braking the primary response.
         s_op, a_op = p[0], p[1]
         progress_floor = 2.0  # m/s -- below this, stalling is penalized
-        model.cost_expr_ext_cost = (self.w_steer * (s - s_op) ** 2
-                                    + self.w_alpha * (a - a_op) ** 2
-                                    + self.w_progress
-                                    * ca.fmax(0.0, progress_floor - v) ** 2)
+        deviation = self.w_steer * (s - s_op) ** 2 + self.w_alpha * (a - a_op) ** 2
+        progress = self.w_progress * ca.fmax(0.0, progress_floor - v) ** 2
+        if self.terminal_set:
+            # The executed input is the first one, so that is where deviation
+            # is charged. Later inputs carry a small weight that keeps the QP
+            # well posed. Any braking the plan needs is then placed as late as
+            # the constraints allow, and the operator's command passes
+            # unchanged until a later start would no longer be safe.
+            model.cost_expr_ext_cost_0 = deviation
+            model.cost_expr_ext_cost = self.w_rest * deviation + progress
+        else:
+            model.cost_expr_ext_cost = deviation + progress
         # There is no blanket terminal-speed penalty: it would brake even on a
         # clear road, opposing the operator for no safety gain. Safety over the
         # horizon comes from the slacked obstacle constraints, which are
@@ -460,26 +522,30 @@ class MPSFSafetyFilter:
         # path constraints: n_obs obstacle rows + 2 lateral-authority rows;
         # terminal: n_obs obstacle rows only (no control at the terminal node).
         no = self.n_obs
-        nh = no + 2
+        n_sl = no + 1 if self.terminal_set else no          # slacked path rows
+        n_e = (no * (1 + len(self.brake_samples)) + 1) if self.terminal_set else no
+        nh = n_sl + 2
         ocp.constraints.lh = np.zeros(nh)
         ocp.constraints.uh = 1e9 * np.ones(nh)
-        ocp.constraints.lh_e = np.zeros(no)
-        ocp.constraints.uh_e = 1e9 * np.ones(no)
+        ocp.constraints.lh_e = np.zeros(n_e)
+        ocp.constraints.uh_e = 1e9 * np.ones(n_e)
         # stage 0: the two hard lateral-authority rows on the executed input.
         ocp.constraints.lh_0 = np.zeros(2)
         ocp.constraints.uh_0 = 1e9 * np.ones(2)
         # slack ONLY the obstacle constraints (path + terminal) so the QP stays
         # feasible; the lateral rows are hard (braking is the feasible escape).
-        ocp.constraints.idxsh = np.arange(no)
-        ocp.constraints.idxsh_e = np.arange(no)
-        ocp.cost.zl = self.slack_lin * np.ones(no)
-        ocp.cost.zu = self.slack_lin * np.ones(no)
-        ocp.cost.Zl = self.slack_quad * np.ones(no)
-        ocp.cost.Zu = self.slack_quad * np.ones(no)
-        ocp.cost.zl_e = self.slack_lin * np.ones(no)
-        ocp.cost.zu_e = self.slack_lin * np.ones(no)
-        ocp.cost.Zl_e = self.slack_quad * np.ones(no)
-        ocp.cost.Zu_e = self.slack_quad * np.ones(no)
+        ocp.constraints.idxsh = np.arange(n_sl)
+        ocp.constraints.idxsh_e = np.arange(n_e)
+        ocp.cost.zl = self.slack_lin * np.ones(n_sl)
+        ocp.cost.zu = self.slack_lin * np.ones(n_sl)
+        ocp.cost.Zl = self.slack_quad * np.ones(n_sl)
+        ocp.cost.Zu = self.slack_quad * np.ones(n_sl)
+        ocp.cost.zl_e = self.slack_lin * np.ones(n_e)
+        ocp.cost.zu_e = self.slack_lin * np.ones(n_e)
+        ocp.cost.Zl_e = self.slack_quad * np.ones(n_e)
+        ocp.cost.Zu_e = self.slack_quad * np.ones(n_e)
+        if self.terminal_set:
+            ocp.cost.cost_type_0 = "EXTERNAL"
 
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.nlp_solver_type = "SQP"
@@ -488,7 +554,11 @@ class MPSFSafetyFilter:
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.sim_method_num_stages = 2
         ocp.solver_options.sim_method_num_steps = 1
-        ocp.solver_options.tf = self.N * self.dt
+        if len(set(self.time_steps)) > 1:
+            ocp.solver_options.tf = float(sum(self.time_steps))
+            ocp.solver_options.time_steps = np.array(self.time_steps)
+        else:
+            ocp.solver_options.tf = self.N * self.dt   # the published value, bit for bit
         ocp.solver_options.print_level = 0
 
         import fcntl
@@ -551,7 +621,18 @@ class MPSFSafetyFilter:
             corridor = safe_r + 1.5  # lateral relevance margin (m)
             on_path_ahead = (d_along > -safe_r) and (abs(d_perp) < corridor)
             # tier 0: on-path threats, soonest first; tier 1: others, nearest.
-            key = (0, d_along) if on_path_ahead else (1, dx * dx + dy * dy)
+            if on_path_ahead and self.terminal_set:
+                # Rank by where the ego's safety circle first touches the
+                # obstacle, then by lateral offset. Ranking by d_along alone
+                # ties across a wall of rocks at one distance, and the tie fell
+                # to list order, which kept off-centre rocks and dropped the
+                # one dead ahead (the published selection, kept below).
+                touch = d_along - np.sqrt(max(safe_r * safe_r - d_perp * d_perp, 0.0))
+                key = (0, touch, abs(d_perp))
+            elif on_path_ahead:
+                key = (0, d_along)
+            else:
+                key = (1, dx * dx + dy * dy)
             scored.append((key, (ox, oy, orad)))
         scored.sort(key=lambda t: t[0])
         return [o for _, o in scored[: self.n_obs]]
@@ -582,13 +663,116 @@ class MPSFSafetyFilter:
             xs = [self._solver.get(k, "x") for k in range(self.N + 1)]
         except Exception:  # noqa: BLE001
             return True  # cannot read the plan back: treat as unsafe
+        pts = [(float(xk[0]), float(xk[1])) for xk in xs]
+        if self.terminal_set and getattr(self, "_last_sense", None) is not None:
+            # The terminal braking segment is part of the plan's safety claim.
+            cx, cy, r_eff, a_term = self._last_sense
+            xn = xs[-1]
+            l_brk = float(xn[3]) ** 2 / (2.0 * a_term)
+            hx, hy = np.cos(float(xn[2])), np.sin(float(xn[2]))
+            for sig in self.brake_samples:
+                pts.append((float(xn[0]) + sig * l_brk * hx,
+                            float(xn[1]) + sig * l_brk * hy))
+            # A stop point outside the sensed region means no plan stays in
+            # known space: the case for maximal braking.
+            sx, sy = pts[-1]
+            if np.hypot(sx - cx, sy - cy) > r_eff + 0.5:
+                return True
         for o in obstacles:
             ox, oy, orad = float(o[0]), float(o[1]), float(o[2])
             hard_r = (orad + self.vehicle_radius + self.ego_forward_extent)
-            for xk in xs:
-                if np.hypot(float(xk[0]) - ox, float(xk[1]) - oy) < hard_r:
+            for px, py in pts:
+                if np.hypot(px - ox, py - oy) < hard_r:
                     return True
         return False
+
+    def _step(self, x, s_cmd, a_cmd, brake_grip, h):
+        """One step of the OCP's model (midpoint rule), for rollouts."""
+        X, Y, psi, v = x
+        delta = s_cmd * self.max_steer
+        a_gain = (self._accel_grip * self.max_accel if a_cmd >= 0.0
+                  else brake_grip * self.max_decel)
+        v_next = float(np.clip(v + a_gain * a_cmd * h, 0.0, self.max_speed))
+        v_mid = 0.5 * (v + v_next)
+        psi_next = psi + v_mid / self.L * np.tan(delta) * h
+        psi_mid = 0.5 * (psi + psi_next)
+        return np.array([X + v_mid * np.cos(psi_mid) * h,
+                         Y + v_mid * np.sin(psi_mid) * h, psi_next, v_next])
+
+    def _backup_rollout(self, z0, s0, a0, brake_grip):
+        """The first input, then full braking with the wheels straight.
+
+        Returns the N+1 states and N inputs over the horizon grid.
+        """
+        xs = [np.array(z0, dtype=float)]
+        us = []
+        for k, h in enumerate(self.time_steps):
+            u = (s0, a0) if k == 0 else (0.0, -1.0)
+            us.append(np.array(u, dtype=float))
+            xs.append(self._step(xs[-1], u[0], u[1], brake_grip, h))
+        return xs, us
+
+    def _path_is_clear(self, xs, obstacles) -> bool:
+        """True when the backup path, continued by straight braking to a stop
+        from its last state, keeps the planning radius from every obstacle in
+        the field and stays inside the sensed region."""
+        cx, cy, r_eff, a_term = self._last_sense
+        pts = [(float(x[0]), float(x[1])) for x in xs[1:]]
+        xn = xs[-1]
+        l_brk = float(xn[3]) ** 2 / (2.0 * a_term)
+        hx, hy = np.cos(float(xn[2])), np.sin(float(xn[2]))
+        for sig in (0.25, 0.5, 0.75, 1.0):
+            pts.append((float(xn[0]) + sig * l_brk * hx, float(xn[1]) + sig * l_brk * hy))
+        for px, py in pts:
+            if np.hypot(px - cx, py - cy) > r_eff:
+                return False
+        for o in obstacles:
+            ox, oy, orad = float(o[0]), float(o[1]), float(o[2])
+            r = orad + self.vehicle_radius + self.ego_forward_extent + self.obstacle_buffer
+            for px, py in pts:
+                if np.hypot(px - ox, py - oy) < r:
+                    return False
+        return True
+
+    def _operator_has_safe_continuation(self, sv, s_op, a_op, obstacles) -> bool:
+        """Solve with the first input fixed to the operator's command.
+
+        True when the solve converges (or stops at the iteration cap) with no
+        slack in use and a plan that passes the full-field check. The stage-0
+        bounds are restored before returning either way.
+        """
+        u_fix = np.array([s_op, a_op])
+        try:
+            sv.constraints_set(0, "lbu", u_fix)
+            sv.constraints_set(0, "ubu", u_fix)
+            status = sv.solve()
+            if status not in (0, 2):
+                return False
+            slack = 0.0
+            for k in range(1, self.N + 1):
+                for field in ("sl", "su"):
+                    vals = sv.get(k, field)
+                    if vals is not None and len(vals):
+                        slack = max(slack, float(np.max(vals)))
+            if slack > self.slack_tol:
+                return False
+            return not self._plan_is_unsafe(obstacles)
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            sv.constraints_set(0, "lbu", np.array([-1.0, -1.0]))
+            sv.constraints_set(0, "ubu", np.array([1.0, 1.0]))
+
+    def _sensed_radius(self) -> float:
+        """Radius around the vehicle that every planned position, and the
+        terminal stop point, must stay inside. An obstacle the filter cannot
+        see yet may sit just past the sensing range, so the range is shrunk by
+        that obstacle's footprint plus the ego's. No range means no limit."""
+        if self.sense_range <= 0.0:
+            return 1.0e4
+        margin = (self.unseen_obstacle_radius + self.vehicle_radius
+                  + self.ego_forward_extent + self.obstacle_buffer)
+        return max(self.sense_range - margin, 1.0)
 
     def filter(self, desired_steering, desired_throttle, desired_brake,
                vehicle_state, obstacles, **_):
@@ -626,6 +810,10 @@ class MPSFSafetyFilter:
             self._stale_brake_count += 1
             return _result(0.0, -1.0, True)
 
+        # The sensed region is centred where the vehicle is now, before the
+        # delay advance below, because that is where the obstacles were sensed.
+        x_sense, y_sense = x, y
+
         # advance the initial state over the command round-trip delay
         if self._teleop_delay > 0.0:
             adv = min(2.0 * self._teleop_delay, 0.5)
@@ -638,9 +826,19 @@ class MPSFSafetyFilter:
         while len(obs) < self.n_obs:
             obs.append((x + 1e4, y + 1e4, 0.1))  # inactive
 
-        p = np.array([s_op, a_op, self._accel_grip, self._brake_grip,
+        brake_grip = self._brake_grip
+        extra = []
+        if self.terminal_set:
+            # One braking model for the stages and the terminal set, margined
+            # below the surrogate's peak: the plant reaches 87 to 94% of it.
+            brake_grip = self.brake_margin * self._brake_grip
+            a_term = max(brake_grip * self.max_decel, 0.5)
+            r_eff = self._sensed_radius()
+            extra = [x_sense, y_sense, r_eff, a_term]
+            self._last_sense = (x_sense, y_sense, r_eff, a_term)
+        p = np.array([s_op, a_op, self._accel_grip, brake_grip,
                       self._lat_accel_max]
-                     + [c for o in obs for c in o], dtype=float)
+                     + [c for o in obs for c in o] + extra, dtype=float)
 
         # Stoppable-speed funnel: the filter sees obstacles only through a
         # horizon of N*dt seconds, so it must never carry a speed it cannot
@@ -659,13 +857,41 @@ class MPSFSafetyFilter:
             sv.set(0, "ubx", z0)
             for k in range(self.N + 1):
                 sv.set(k, "p", p)
-                if k > 0:
+                if k > 0 and not self.terminal_set:
                     v_cap = min(self.max_speed,
                                 max(v_stop, v0 - k * self.dt * a_brk))
                     sv.constraints_set(k, "ubx", np.array([v_cap]))
             # warm start toward holding the operator command
             for k in range(self.N):
                 sv.set(k, "u", np.array([s_op, a_op]))
+            if self.terminal_set:
+                # Certify the operator's command first. It passes untouched when
+                # (a) applying it for one step and then braking straight to a stop
+                # stays clear of the whole field and inside the sensed region, or
+                # (b) the OCP finds some other continuation of it that ends in the
+                # terminal set without slack. (a) does not depend on the horizon,
+                # and a longer horizon only gives (b) more continuations, so the
+                # set of accepted commands can only grow with the horizon.
+                bx, bu = self._backup_rollout(z0, s_op, a_op, brake_grip)
+                if self._path_is_clear(bx, obstacles):
+                    self._pass_count += 1
+                    return _result(s_op, a_op, False)
+                for k in range(self.N + 1):
+                    sv.set(k, "x", bx[k])
+                for k in range(self.N):
+                    sv.set(k, "u", bu[k])
+                if self._operator_has_safe_continuation(sv, s_op, a_op, obstacles):
+                    self._pass_count += 1
+                    self._ocp_pass_count += 1
+                    return _result(s_op, a_op, False)
+                # Correction: start from braking now, the continuation most
+                # likely to be feasible, and let the OCP find the smallest
+                # first-step change, swerve included.
+                bx, bu = self._backup_rollout(z0, s_op, -1.0, brake_grip)
+                for k in range(self.N + 1):
+                    sv.set(k, "x", bx[k])
+                for k in range(self.N):
+                    sv.set(k, "u", bu[k])
             status = sv.solve()
             u0 = sv.get(0, "u")
             ok = status in (0, 2)  # 0 success, 2 max-iter (still usable)
@@ -674,6 +900,7 @@ class MPSFSafetyFilter:
 
         if u0 is None or not ok or not np.all(np.isfinite(u0)):
             # fail closed: hold (authority-clamped) steer, brake
+            self._solve_fail_count += 1
             return _result(s_op, -1.0, True)
 
         # An accepted solve is executed only if its own predicted trajectory
