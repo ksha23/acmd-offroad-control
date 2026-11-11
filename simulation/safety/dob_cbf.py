@@ -311,7 +311,15 @@ class CBFSafetyFilter:
                  cbf_flavor: str = 'balance',
                  teleop_delay: float = 0.0,
                  stale_cmd_timeout: float = 2.0,
-                 variant: str = 'dob_cbf'):
+                 variant: str = 'dob_cbf',
+                 braking_barrier: bool = False,
+                 brake_margin: float = 0.85,
+                 gamma_brake: float = 3.0,
+                 sense_range: float = 30.0,
+                 unseen_obstacle_radius: float = 1.0,
+                 front_extent: float = 2.6,
+                 corridor_half_width: float = 1.2,
+                 **_ignored):
 
         # Filter variant label, recorded in diagnostics so a run's logs
         # identify which barrier configuration produced them.
@@ -393,6 +401,36 @@ class CBFSafetyFilter:
         self._grip_scale = 1.0
         self._use_grip_scale = False
 
+        # Braking-distance barrier (opt-in). The ellipse barrier above is a
+        # function of position only, so where it starts braking does not move
+        # with speed or soil. This first-order barrier on the along-track gap,
+        #   h_b = gap - v^2 / (2 a_h),   a_h = brake_margin * a_soil,
+        # is the adaptive-cruise-control form of Ames et al. (2017): its zero
+        # set is the last point from which braking at the soil's deceleration
+        # still stops short, so its onset grows with v^2 / a_soil. a_soil is
+        # the rig surrogate's peak braking deceleration on the believed soil,
+        # the same number MPSF uses. A second row of the same form treats the
+        # edge of the sensing range as an obstacle, which limits speed to what
+        # can be stopped inside the sensed region.
+        self.braking_barrier = bool(braking_barrier)
+        self.brake_margin = float(brake_margin)
+        self.gamma_brake = float(gamma_brake)
+        self.sense_range = float(sense_range) if sense_range else 0.0
+        self.unseen_obstacle_radius = float(unseen_obstacle_radius)
+        self.front_extent = float(front_extent)
+        self.corridor_half_width = float(corridor_half_width)
+        self._a_soil = 6.0          # soil-blind default, the nominal max_decel
+        self._a_soil_source = "default"
+        self._brake_rows_binding = 0
+        self._last_brake_ub = float('inf')
+        from .authority import static_axle_loads
+        self._fz_f_static, self._fz_r_static, self._mass_static = static_axle_loads()
+
+        # Clock for command ages, staleness and the steering lag. Wall time by
+        # default (the published behaviour). set_clock() swaps in simulation
+        # time, which makes the filter independent of machine load.
+        self._clock = time.time
+
         # Current steering angle state (integrated from dbeta)
         self._beta = 0.0  # road wheel angle (rad)
         self._alpha = 0.0  # last throttle command
@@ -406,7 +444,7 @@ class CBFSafetyFilter:
         # can produce.
         self._last_safe_steering = 0.0   # last (slewed) normalized steering out
         self._reactive_dir = 0.0         # committed reactive-steer side (hysteresis)
-        self._last_filter_wall = None    # wall time of previous filter() call
+        self._last_filter_wall = None    # clock time of previous filter() call
         self._steer_track_ema = 0.0      # EMA of |measured - commanded| road angle
         self._steer_broken = False       # latched once a break is detected
 
@@ -435,6 +473,15 @@ class CBFSafetyFilter:
     # ------------------------------------------------------------------
     # Teleop delay API
     # ------------------------------------------------------------------
+
+    def set_clock(self, clock):
+        """Use ``clock()`` (seconds) instead of wall time.
+
+        It drives the command-age smoother, the stale-command brake and the
+        steering lag. With wall time all three depend on how fast the machine
+        runs the simulation, which made repeated runs differ.
+        """
+        self._clock = clock
 
     def set_teleop_delay(self, delay_s: float):
         """Set estimated one-way teleop network delay (seconds)."""
@@ -491,6 +538,33 @@ class CBFSafetyFilter:
             grip *= self._grip_scale
         self.max_accel = 3.0 * grip
         self.max_decel = -6.0 * grip
+        if self.braking_barrier:
+            self._update_soil_braking(terrain_params, n_eff)
+
+    def _update_soil_braking(self, terrain_params, n_eff):
+        """Peak braking deceleration on the believed soil, from the surrogate.
+
+        Evaluated at the hedged exponent when a hedge is in force. Without a
+        surrogate or a full soil description, the soil-blind default stays.
+        """
+        if self.nn_casadi is None or not isinstance(terrain_params, dict):
+            return
+        required = ("Kphi", "Kc", "c", "phi", "k", "n")
+        if any(terrain_params.get(key) is None for key in required):
+            return
+        terrain = dict(terrain_params)
+        terrain["n"] = float(n_eff)
+        try:
+            from .authority import peak_braking_decel
+            a = peak_braking_decel(self.nn_casadi, terrain, self._fz_f_static,
+                                   self._fz_r_static, self._mass_static)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [CBF] braking authority query failed ({type(e).__name__}: {e}); "
+                  f"keeping a_soil={self._a_soil:.2f}")
+            return
+        if a > 0.0:
+            self._a_soil = float(np.clip(a, 0.5, 9.81))
+            self._a_soil_source = "surrogate"
 
     def update_command_age(self, cmd_wall_time: float):
         """
@@ -503,7 +577,7 @@ class CBFSafetyFilter:
         Args:
             cmd_wall_time: The ``wall_time`` field from the ControlCommand.
         """
-        now = time.time()
+        now = self._clock()
         one_way = max(now - cmd_wall_time, 0.0)
         self._cmd_age = one_way
         self._last_cmd_wall = now  # arrival time of the most recent command
@@ -536,7 +610,7 @@ class CBFSafetyFilter:
         """True if no command received within stale_cmd_timeout (teleop only)."""
         if self._teleop_delay <= 0.0 or self._last_cmd_wall is None:
             return False
-        age = time.time() - self._last_cmd_wall
+        age = self._clock() - self._last_cmd_wall
         return age > self._stale_cmd_timeout
 
     def _init_csv_logging(self):
@@ -925,7 +999,7 @@ class CBFSafetyFilter:
             )
             self._last_result = safe_result
             if self._filter_count % 20 == 0:
-                age = time.time() - self._last_cmd_wall if self._last_cmd_wall else float('inf')
+                age = self._clock() - self._last_cmd_wall if self._last_cmd_wall else float('inf')
                 print(f"  [CBF #{self._filter_count}] STALE COMMAND — age={age:.2f}s > "
                       f"timeout={self._stale_cmd_timeout:.1f}s  ** EMERGENCY BRAKE **")
             return safe_result
@@ -1204,6 +1278,16 @@ class CBFSafetyFilter:
                 psi1[0], psi1[1],
             ))
 
+        if self.braking_barrier:
+            ub = self._braking_alpha_bound(x, y, psi, v, omega, obstacles,
+                                           effective_buffer, accel_gain)
+            self._last_brake_ub = ub
+            if ub < 1.0:
+                A_ineq_list.append(np.array([0.0, 1.0, 0.0]))
+                b_ineq_list.append(ub)
+                if ub < desired_alpha:
+                    self._brake_rows_binding += 1
+
         # Speed limit constraint (terrain-aware). Column 3 is the CBF slack,
         # which does not enter the speed limit. Throttle is what drives the
         # speed up, so the row bounds alpha from *above*; a negated
@@ -1373,10 +1457,13 @@ class CBFSafetyFilter:
         # that alternation is high-frequency and the lag attenuates it into a
         # single steady command, while a sustained operator or avoidance input
         # is low-frequency and passes through with only the actuator's small
-        # delay. The wall-clock interval between calls is used, so both the cap
-        # and the lag are correct at the rate the filter actually runs.
-        dt_call = (t_start - self._last_filter_wall) if self._last_filter_wall else self.control_dt
-        self._last_filter_wall = t_start
+        # delay. The interval between calls is measured on the filter's clock
+        # (wall time unless set_clock() supplied simulation time), so both the
+        # cap and the lag are correct at the rate the filter actually runs.
+        # With the default wall clock this is the call's start time, as published.
+        t_clock = t_start if self._clock is time.time else self._clock()
+        dt_call = (t_clock - self._last_filter_wall) if self._last_filter_wall else self.control_dt
+        self._last_filter_wall = t_clock
         dt_call = float(np.clip(dt_call, 0.005, 0.1))
         prev = self._last_safe_steering
         # 1) first-order lag toward the full target -- passes the steady (human /
@@ -1477,6 +1564,53 @@ class CBFSafetyFilter:
                   f" | v_max_t={v_max_terrain:.1f}{delay_tag}{mod_tag}")
 
         return self._last_result
+
+    def _braking_alpha_bound(self, x, y, psi, v, omega, obstacles,
+                             effective_buffer, g_thrust) -> float:
+        """Upper bound on alpha from the braking-distance barrier rows.
+
+        For each obstacle ahead whose footprint overlaps the vehicle's lane,
+        h_b = gap - v^2 / (2 a_h), and the first-order condition
+        dh_b/dt + gamma h_b >= 0 with dv/dt = a_h alpha (braking) reads
+        alpha <= (gamma h_b - v_c) / v, where v_c is the closing speed of the
+        gap. Under throttle dv/dt = g_thrust alpha, which rescales the bound by
+        a_h / g_thrust. The sensing-range row is the same with the gap fixed at
+        the sensed radius. The bound is clipped at the most negative alpha the
+        rate limit allows this step, so the row can never make the QP
+        infeasible, and full braking is what remains when nothing else can
+        restore the barrier.
+        """
+        a_h = max(self.brake_margin * self._a_soil, 0.3)
+        g_t = max(float(g_thrust), 0.3)
+        v_s = max(float(v), 0.5)
+        gam = self.gamma_brake
+
+        def bound(r):
+            if r >= 0.0:
+                return r / v_s * min(1.0, a_h / g_t)
+            return r / v_s
+
+        ub = float('inf')
+        cps, sps = np.cos(psi), np.sin(psi)
+        for o in obstacles:
+            ox, oy, orad = float(o[0]), float(o[1]), float(o[2])
+            rx, ry = ox - x, oy - y
+            lon = rx * cps + ry * sps
+            lat = -rx * sps + ry * cps
+            if lon <= 0.0 or abs(lat) > orad + self.corridor_half_width + effective_buffer:
+                continue
+            gap = lon - (orad + self.front_extent + effective_buffer)
+            h_b = gap - v * v / (2.0 * a_h)
+            v_c = v - omega * lat
+            ub = min(ub, bound(gam * h_b - v_c))
+        if self.sense_range > 0.0:
+            r_eff = self.sense_range - (self.unseen_obstacle_radius
+                                        + self.front_extent + effective_buffer)
+            h_s = r_eff - v * v / (2.0 * a_h)
+            ub = min(ub, bound(gam * h_s))
+        a_cur = float(np.clip(self._alpha, -1.0, 1.0))
+        a_floor = max(-1.0, a_cur - self.max_alpha_rate * self.control_dt)
+        return float(min(max(ub, a_floor), 1.0))
 
     def _compute_terrain_speed_limit(self, speed: float, roughness: float,
                                       delta: float) -> float:
@@ -1595,4 +1729,8 @@ class CBFSafetyFilter:
             'last_safety_margin': result.safety_margin if result else float('inf'),
             'last_active_constraints': result.active_constraints if result else 0,
             'last_dob_norm': result.dob_norm if result else 0.0,
+            'braking_barrier': self.braking_barrier,
+            'a_soil': self._a_soil,
+            'a_soil_source': self._a_soil_source,
+            'brake_rows_binding': self._brake_rows_binding,
         }
