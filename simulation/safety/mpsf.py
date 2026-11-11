@@ -112,12 +112,14 @@ class MPSFSafetyFilter:
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
         # Formulation switch. False keeps the published filter: deviation cost
         # on every stage and a per-stage speed funnel tied to the horizon
-        # length. True selects the terminal-set filter: the plan must end in a
-        # state from which straight-line braking stops clear of every known
-        # obstacle and inside the sensed region, the deviation cost sits on the
-        # executed (first) input, and there is no speed funnel. Its safety does
-        # not depend on the horizon length, and a longer horizon only enlarges
-        # the set of commands it can accept.
+        # length. True selects the terminal-set filter. Every executed command
+        # is certified by one step of it followed by straight braking to a
+        # stop, clear of every known obstacle and inside the sensed region. The
+        # OCP, whose plan must end in that same braking set and whose deviation
+        # cost sits on the first input, proposes the correction when the
+        # operator's command fails. There is no speed funnel. Safety does not
+        # depend on the horizon length, and a longer horizon only improves the
+        # proposals.
         self.terminal_set = bool(terminal_set)
         self.sense_range = float(sense_range) if sense_range else 0.0
         self.unseen_obstacle_radius = float(unseen_obstacle_radius)
@@ -200,8 +202,9 @@ class MPSFSafetyFilter:
         self._fail_stop_count = 0   # accepted solve whose plan was still unsafe
         self._solve_fail_count = 0  # solver status outside {0, 2}: fail-closed brake
         self._pass_count = 0        # terminal set: operator command certified as is
-        self._ocp_pass_count = 0    # of those, certified by the OCP, not the backup
-        self.slack_tol = 1.0e-3     # m^2, slack above this means no safe continuation
+        self._hold_count = 0        # standstill holds (terminal set)
+        self._fallback_count = 0    # OCP correction not certified, harder braking used
+        self.hold_speed = 0.5       # m/s, below which an uncertified command is held
         self._lat_clamp_count = 0   # executed steering clamped to soil authority
         self._stale_brake_count = 0
         self._solve_ms_ema = 0.0
@@ -359,7 +362,8 @@ class MPSFSafetyFilter:
                 "fail_stops": self._fail_stop_count,
                 "solve_fails": self._solve_fail_count,
                 "certified_passes": self._pass_count,
-                "ocp_certified_passes": self._ocp_pass_count,
+                "standstill_holds": self._hold_count,
+                "certified_fallbacks": self._fallback_count,
                 "terminal_set": self.terminal_set,
                 "horizon_s": float(sum(self.time_steps)),
                 "lat_clamps": self._lat_clamp_count,
@@ -753,34 +757,39 @@ class MPSFSafetyFilter:
                     return False
         return True
 
-    def _operator_has_safe_continuation(self, sv, s_op, a_op, obstacles) -> bool:
-        """Solve with the first input fixed to the operator's command.
-
-        True when the solve converges (or stops at the iteration cap) with no
-        slack in use and a plan that passes the full-field check. The stage-0
-        bounds are restored before returning either way.
-        """
-        u_fix = np.array([s_op, a_op])
-        try:
-            sv.constraints_set(0, "lbu", u_fix)
-            sv.constraints_set(0, "ubu", u_fix)
-            status = sv.solve()
-            if status not in (0, 2):
-                return False
-            slack = 0.0
-            for k in range(1, self.N + 1):
-                for field in ("sl", "su"):
-                    vals = sv.get(k, field)
-                    if vals is not None and len(vals):
-                        slack = max(slack, float(np.max(vals)))
-            if slack > self.slack_tol:
-                return False
-            return not self._plan_is_unsafe(obstacles)
-        except Exception:  # noqa: BLE001
+    def _certified(self, z0, s_cmd, a_cmd, brake_grip, obstacles) -> bool:
+        """One step of the command, then straight braking to a stop, is safe."""
+        if not self._within_friction_ellipse(s_cmd, a_cmd, z0[3], brake_grip):
             return False
-        finally:
-            sv.constraints_set(0, "lbu", np.array([-1.0, -1.0]))
-            sv.constraints_set(0, "ubu", np.array([1.0, 1.0]))
+        bx, _ = self._backup_rollout(z0, s_cmd, a_cmd, brake_grip)
+        return self._path_is_clear(bx, obstacles)
+
+    def _certified_correction(self, z0, s_op, a_op, u0, ok, brake_grip, obstacles,
+                              result):
+        """Execute the OCP's correction if it certifies, else brake harder.
+
+        Candidates in order: the OCP's first input, then its steering with
+        progressively harder braking, then straight full braking. The first
+        candidate that certifies is executed. If none does, the collision cannot
+        be avoided by braking from here and straight full braking is applied.
+        """
+        candidates = []
+        if u0 is not None and ok and np.all(np.isfinite(u0)):
+            s_c = float(np.clip(u0[0], -1, 1))
+            a_c = float(np.clip(u0[1], -1, 1))
+            candidates.append((s_c, a_c))
+            for a in np.linspace(a_c, -1.0, 5)[1:]:
+                candidates.append((s_c, float(a)))
+        else:
+            self._solve_fail_count += 1
+        candidates.append((0.0, -1.0))
+        for s_c, a_c in candidates:
+            if self._certified(z0, s_c, a_c, brake_grip, obstacles):
+                if (s_c, a_c) != candidates[0]:
+                    self._fallback_count += 1
+                return result(s_c, a_c, True)
+        self._fail_stop_count += 1
+        return result(0.0, -1.0, True)
 
     def _sensed_radius(self) -> float:
         """Radius around the vehicle that every planned position, and the
@@ -884,26 +893,28 @@ class MPSFSafetyFilter:
             for k in range(self.N):
                 sv.set(k, "u", np.array([s_op, a_op]))
             if self.terminal_set:
-                # Certify the operator's command first. It passes untouched when
-                # (a) applying it for one step and then braking straight to a stop
-                # stays clear of the whole field and inside the sensed region, or
-                # (b) the OCP finds some other continuation of it that ends in the
-                # terminal set without slack. (a) does not depend on the horizon,
-                # and a longer horizon only gives (b) more continuations, so the
-                # set of accepted commands can only grow with the horizon.
-                bx, bu = self._backup_rollout(z0, s_op, a_op, brake_grip)
-                if (self._within_friction_ellipse(s_op, a_op, z0[3], brake_grip)
-                        and self._path_is_clear(bx, obstacles)):
+                # Every executed command is certified by one explicit test: apply
+                # it for one step, then brake straight to a stop at the margined
+                # soil deceleration, inside the friction ellipse, and the path
+                # must stay clear of the whole field and inside the sensed
+                # region. The test runs to the stop, not to the end of the
+                # horizon, so safety does not depend on N. The OCP only proposes
+                # corrections, and a longer horizon can only propose better ones.
+                # A plan that relies on a later swerve is not certified, because
+                # the kinematic model is optimistic about turning on low grip.
+                if self._certified(z0, s_op, a_op, brake_grip, obstacles):
                     self._pass_count += 1
                     return _result(s_op, a_op, False)
-                for k in range(self.N + 1):
-                    sv.set(k, "x", bx[k])
-                for k in range(self.N):
-                    sv.set(k, "u", bu[k])
-                if self._operator_has_safe_continuation(sv, s_op, a_op, obstacles):
-                    self._pass_count += 1
-                    self._ocp_pass_count += 1
-                    return _result(s_op, a_op, False)
+                if z0[3] < self.hold_speed:
+                    # Standstill hold. Nearly stopped and the command cannot be
+                    # certified: hold the backup itself, full brake with the
+                    # wheels straight. A minimum-deviation correction here
+                    # alternates with certified throttle steps and prefers hard
+                    # steering, which is cheap at low speed, so the vehicle
+                    # inches along an arc into the obstacle beside the one it
+                    # stopped for.
+                    self._hold_count += 1
+                    return _result(0.0, -1.0, True)
                 # Correction: start from braking now, the continuation most
                 # likely to be feasible, and let the OCP find the smallest
                 # first-step change, swerve included.
@@ -917,6 +928,10 @@ class MPSFSafetyFilter:
             ok = status in (0, 2)  # 0 success, 2 max-iter (still usable)
         except Exception:  # noqa: BLE001
             u0 = None; ok = False
+
+        if self.terminal_set:
+            return self._certified_correction(z0, s_op, a_op, u0, ok, brake_grip,
+                                              obstacles, _result)
 
         if u0 is None or not ok or not np.all(np.isfinite(u0)):
             # fail closed: hold (authority-clamped) steer, brake
