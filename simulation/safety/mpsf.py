@@ -107,6 +107,7 @@ class MPSFSafetyFilter:
                  brake_margin: float = 0.85,
                  w_rest: float = 0.01,
                  time_steps=None,
+                 pedal_rate: float = 8.0,
                  build_solver: bool = True,
                  **_ignored):
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
@@ -126,6 +127,12 @@ class MPSFSafetyFilter:
         self.brake_margin = float(brake_margin)
         self.w_rest = float(w_rest)
         self.brake_samples = (0.5, 1.0)
+        # Pedal (alpha) rate limit of the plant's actuator model, per second.
+        # The plant node applies it after the filter in operator and replay
+        # runs, so throttle 0.9 to full brake takes about 0.24 s. The backup
+        # check models that ramp, which it otherwise books as instant braking.
+        self.pedal_rate = float(pedal_rate)
+        self._alpha_applied = 0.0
         if time_steps:
             self.time_steps = tuple(float(t) for t in time_steps)
             self.N = len(self.time_steps)
@@ -725,14 +732,27 @@ class MPSFSafetyFilter:
     def _backup_rollout(self, z0, s0, a0, brake_grip):
         """The first input, then full braking with the wheels straight.
 
-        Returns the N+1 states and N inputs over the horizon grid.
+        The applied pedal follows the commands through the plant's rate limit,
+        starting from where the last executed command has brought it. Returns
+        the N+1 states and N commanded inputs over the horizon grid.
         """
         xs = [np.array(z0, dtype=float)]
         us = []
+        x = xs[0]
+        alpha = self._alpha_applied
+        sub = 0.02
+        t = 0.0
         for k, h in enumerate(self.time_steps):
             u = (s0, a0) if k == 0 else (0.0, -1.0)
             us.append(np.array(u, dtype=float))
-            xs.append(self._step(xs[-1], u[0], u[1], brake_grip, h))
+            n_sub = max(1, int(round(h / sub)))
+            for _ in range(n_sub):
+                # The applied pedal moves toward the command at the plant's rate.
+                d = self.pedal_rate * (h / n_sub)
+                alpha += float(np.clip(u[1] - alpha, -d, d))
+                x = self._step(x, u[0], alpha, brake_grip, h / n_sub)
+                t += h / n_sub
+            xs.append(x)
         return xs, us
 
     def _path_is_clear(self, xs, obstacles) -> bool:
@@ -817,6 +837,9 @@ class MPSFSafetyFilter:
             if abs(s_c - s_val) > 1e-9:
                 self._lat_clamp_count += 1
             a_c = float(np.clip(a_val, -1, 1))
+            # Where the plant's rate-limited pedal will be at the next call.
+            step = self.pedal_rate * self.time_steps[0]
+            self._alpha_applied += float(np.clip(a_c - self._alpha_applied, -step, step))
             modified = bool(modified or abs(s_c - s_op) > 1e-3)
             if modified:
                 self._modify_count += 1
