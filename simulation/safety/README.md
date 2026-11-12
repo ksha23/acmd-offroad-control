@@ -144,7 +144,8 @@ specifies. The published filter above stays the default, unchanged.
   limits form the input box. The pedal-to-acceleration map and the rolling
   resistance come from the surrogate (braking as the torque balance of
   `surrogate_dynamics.py`, traction capped by its drive force).
-* Barriers: the paper's heading-aligned ellipse as a high-order CBF with real
+* Barriers: the distance barrier `h = |p - p_o|^2 - r^2` (Zhang et al.'s
+  ellipse with equal semi-axes) as a high-order CBF with real
   roots (p1 = p2 = sqrt(cbf_alpha)) and exact derivatives, the braking-distance
   barrier of Ames et al. (TAC 2017) on lane obstacles with the margined
   surrogate deceleration, and the same barrier at the sensing edge. Traffic
@@ -160,11 +161,11 @@ specifies. The published filter above stays the default, unchanged.
 What it drops from the published filter: the slack, the reactive-steering
 backup, the emergency predictor, the rear-approach guard, the speed-dependent
 radius inflation, the steering lag and slew applied after the QP, the terrain
-speed cap, and the dropping of receding barrier rows. With the published
-ellipse (w_long 0.06, bias 3.0) the ellipse is a long standoff, and on clay the
-QP turns infeasible once the vehicle has braked inside it, which brakes and
-holds: the published standoff behaviour, now explicit instead of absorbed by
-slack.
+speed cap, the dropping of receding barrier rows, and the elongated, shifted
+ellipse (`w_long`, `w_lat`, `forward_bias` are ignored). With the published
+ellipse (w_long 0.06, bias 3.0) a vehicle 9 to 16 m ahead of a stopped car is
+inside the barrier, so the QP is infeasible and the filter brakes and holds.
+The braking-distance barrier keeps the headway instead.
 
 ## `mpsf` — predictive filter
 

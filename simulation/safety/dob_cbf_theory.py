@@ -19,10 +19,14 @@ for |d'| <= b, and that bound sigma tightens every barrier row in the
 worst-case direction.
 
 Barriers.
-* Each obstacle: the paper's heading-aligned ellipse h = w1 d_al^2 + w2 d_cr^2 -
-  r^2, relative degree two, enforced as the high-order CBF condition
+* Each obstacle: the distance barrier h = |p - p_o|^2 - r^2, relative degree
+  two, enforced as the high-order CBF condition
   psi1 = h' + p1 h,  psi1' + p2 psi1 >= 0, with real roots p1 = p2 =
-  sqrt(cbf_alpha) and the exact derivatives (CasADi).
+  sqrt(cbf_alpha) and the exact derivatives (CasADi). This is the ellipse
+  barrier of Zhang et al. (CCTA 2025, eq. 6) with equal semi-axes. The
+  published filter's ellipse is about four times longer along the heading
+  than across and is shifted forward, so a vehicle 9 m ahead of a stopped car
+  is already inside it. Headway comes from the braking-distance barrier.
 * Each obstacle in the lane: the braking-distance barrier of Ames et al. (IEEE
   TAC 2017, adaptive cruise control), h_b = gap - v tau - v^2 / (2 a_h), with
   a_h the margined surrogate braking deceleration on the believed soil, as a
@@ -117,9 +121,6 @@ class TheoryCBFSafetyFilter:
                  obstacle_buffer: float = 0.25,
                  vehicle_radius: float = 1.0,
                  control_dt: float = 0.1,
-                 w_long: float = 0.15,
-                 w_lat: float = 0.50,
-                 forward_bias: float = 1.5,
                  dob_bandwidth: float = 10.0,
                  cbf_flavor: str = 'balance',
                  teleop_delay: float = 0.0,
@@ -150,7 +151,6 @@ class TheoryCBFSafetyFilter:
         self.p1 = self.p2 = float(np.sqrt(max(float(cbf_alpha), 1e-6)))
         self.obstacle_buffer = float(obstacle_buffer)
         self.vehicle_radius = float(vehicle_radius)
-        self.w_long, self.w_lat, self.bias = float(w_long), float(w_lat), float(forward_bias)
         # Observer gain, k dt <= 0.5 (dt k = 1 makes the estimate a raw difference).
         self.k_obs = min(float(dob_bandwidth), 0.5 / self.dt)
         self.b_d = float(disturbance_rate_bound)
@@ -270,7 +270,7 @@ class TheoryCBFSafetyFilter:
 
     # -- barriers -------------------------------------------------------------------
     def _build_hocbf(self):
-        """Exact derivatives of the ellipse barrier along the kinematic model.
+        """Exact derivatives of the distance barrier along the kinematic model.
 
         The obstacle's position is part of the state and moves at its measured
         constant velocity, so a moving vehicle enters h' and h''.
@@ -279,9 +279,7 @@ class TheoryCBFSafetyFilter:
         o = ca.SX.sym("o", 3)     # r_safe, vox, voy
         p1 = ca.SX.sym("p1")
         X, Y, psi, v, delta, ox, oy = (x[i] for i in range(7))
-        d_al = ca.cos(psi) * (X - ox) + ca.sin(psi) * (Y - oy) + self.bias
-        d_cr = -ca.sin(psi) * (X - ox) + ca.cos(psi) * (Y - oy)
-        h = self.w_long * d_al ** 2 + self.w_lat * d_cr ** 2 - o[0] ** 2
+        h = (X - ox) ** 2 + (Y - oy) ** 2 - o[0] ** 2
         f0 = ca.vertcat(v * ca.cos(psi), v * ca.sin(psi), v * ca.tan(delta) / self.L, 0, 0,
                         o[1], o[2])
         h_dot = ca.mtimes(ca.jacobian(h, x), f0)

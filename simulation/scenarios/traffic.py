@@ -278,6 +278,7 @@ class TrafficManager:
         self.specs = specs
         self.vehicles: list[TrafficVehicle] = []
         self._released = False   # convoy holds until the ego starts moving
+        self.release_after_s = 3.0
 
     @classmethod
     def from_preset(cls, name: str, ego_lane_y: float = 0.0) -> "TrafficManager":
@@ -301,8 +302,12 @@ class TrafficManager:
         # The convoy is released once the ego is moving, so the encounter
         # happens at the intended point on the path rather than at the spawn.
         # Rear-approach scenarios start immediately, since a vehicle closing
-        # from behind must be given the distance to catch the ego.
+        # from behind must be given the distance to catch the ego. After
+        # release_after_s the convoy goes anyway, so an ego that does not start
+        # cannot hold the scene still.
         if not self._released and ego_speed is not None and ego_speed > 0.5:
+            self._released = True
+        if t >= self.release_after_s:
             self._released = True
         rear_only = all(s.heading_deg == 0.0 and s.init_x < 0.0 for s in self.specs)
         hold = (ego_speed is not None) and (not self._released) and not rear_only

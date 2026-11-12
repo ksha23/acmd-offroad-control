@@ -1,9 +1,9 @@
 """Contracts of the textbook DOB-CBF (simulation/safety/dob_cbf_theory.py).
 
 The QP solver is checked against brute force, the barrier derivatives against
-finite differences along the model, and the filter against the two plain
-contracts: a safe command passes unchanged, and a command into a wall too close
-to stop for is braked.
+finite differences along the model, and the filter against the plain
+contracts: a safe command passes unchanged, a stopped car can start behind a
+standing vehicle, and a command into a wall too close to stop for is braked.
 """
 import numpy as np
 import pytest
@@ -74,6 +74,16 @@ def test_clear_road_passes_unchanged(clay_filter):
     r = clay_filter.filter(0.0, 0.4, 0.0, _state(0.0, 6.0), [])
     assert not r.was_modified
     assert r.throttle == pytest.approx(0.4)
+
+
+def test_starts_behind_a_standing_vehicle():
+    # A vehicle standing 9 m ahead of a stopped car, as the convoy is held in
+    # the battery's traffic modes, leaves room to start.
+    f = TheoryCBFSafetyFilter(VP, control_dt=0.1, sense_range=0)
+    f.update_terrain(terrain_preset_to_internal(get_terrain_preset("clay")))
+    r = f.filter(0.0, 0.4, 0.0, _state(0.0, 0.0), [(9.0, 0.0, 2.2, True, 0.0, 0.0)])
+    assert r.braking == 0.0
+    assert r.throttle > 0.0
 
 
 def test_wall_too_close_is_braked():
