@@ -1840,6 +1840,9 @@ def run_sim_node(args):
                     _los = (_h[1:] - (_h[0] + 2.1)) / _s[1:]
                     _seen = np.concatenate([[True], _los >= np.maximum.accumulate(_los) - 1e-9])
                     _h = _h + grade_noise_rng.normal(0.0, 1.0, _h.shape) * (0.02 + 0.002 * _s)
+                    # A pitch error in the pose the map is built in (nose up
+                    # positive) tilts every height by s tan(bias).
+                    _h = _h + _s * np.tan(np.radians(args.filter_preview_pitch_bias_deg))
                     _h[~_seen] = np.nan
                 veh_state['terrain_ahead'] = (_ds, _h)
             sf_result = safety_filter.filter(
@@ -2692,6 +2695,11 @@ def main():
                         "them, ground hidden behind a crest unknown and a height "
                         "error of 0.02 m + 0.2 percent of range; the filter takes "
                         "unknown ground as its steepest admissible downgrade.")
+    p.add_argument("--filter-preview-pitch-bias-deg", type=float, default=0.0,
+                   help="--filter-grade-preview lidar only: a pitch error (deg, nose "
+                        "up positive) in the pose the map is built in. A height s "
+                        "metres ahead reads s tan(bias) higher, so a positive bias "
+                        "makes a downgrade look shallower.")
     p.add_argument("--safety-sim-clock", action="store_true",
                    help="Run the safety filter's command-age smoother, stale-command "
                         "brake and steering lag on simulation time instead of wall "

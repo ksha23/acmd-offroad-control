@@ -487,6 +487,7 @@ Examples:
     p.add_argument("--cbf-gamma-brake", type=float, default=None)
     p.add_argument("--filter-sense-range", type=float, default=None)
     p.add_argument("--filter-grade-preview", type=str, default=None)
+    p.add_argument("--filter-preview-pitch-bias-deg", type=float, default=None)
     p.add_argument("--terrain-grade", type=float, default=None)
     p.add_argument("--terrain-grade-start-x", type=float, default=None)
     p.add_argument("--safety-sim-clock", action="store_true")
@@ -664,7 +665,8 @@ Examples:
         for flag in ("mpsf_time_grid", "mpsf_psf_cost", "mpsf_w_rest", "mpsf_brake_margin",
                      "cbf_brake_margin",
                      "cbf_gamma_brake", "filter_sense_range", "traffic_speed_noise",
-                     "filter_grade_preview", "terrain_grade", "terrain_grade_start_x"):
+                     "filter_grade_preview", "terrain_grade", "terrain_grade_start_x",
+                     "filter_preview_pitch_bias_deg"):
             value = getattr(args, flag)
             if value not in (None, ""):
                 sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])
