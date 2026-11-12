@@ -11,18 +11,18 @@ command at the plant's rate limit. a(p, v) is the derived model's speed rate (ri
 the soil's motion resistance, braking fading out at a standstill, gravity on a previewed grade).
 
 Backup. Straight (delta = 0), the pedal ramped to full brake at the rate limit and held to a stop. On the model it
-travels S_model(v, p). The identified bounds put the plant's stop within s0 + s1 S_model along the heading and
-within l0 + l1 S_model of that line. The swept region of the footprint discs is the segment from the rear disc
-centre to the front disc centre plus that stop, inflated by the disc radius and the lateral bound.
+travels S_model(v, p). The identified bounds put the plant's front edge within s0 + s1 S_model of its starting
+place and every corner within l0 + l1 S_model of the sides (``footprint.py``: the body rectangle). The swept region
+is the body rectangle lengthened forward by that stop and widened by that drift, in the body frame now.
 
-Barrier, per obstacle: h = distance(obstacle's set, swept segment) - (obstacle radius + disc radius + lateral bound
-+ sampled-data margin). A rock's set is its centre. A vehicle's is the segment it can cover along its heading
+Barrier, per obstacle: h = distance(obstacle's set, swept rectangle) - (obstacle radius + sampled-data margin). A rock's set is its centre. A vehicle's is the segment it can cover along its heading
 during the backup's stopping time, up to its speed plus the measurement error and accelerating at the drive
 capability of the believed soil. Under the backup the stop point does not move and the swept segment shrinks into
 itself, so a static obstacle's h does not decrease: the QP is feasible from h >= 0 (backup control barrier
 functions, Gurriet et al. 2018, Chen et al. 2021).
 
-Sensing edge: the swept region must stay inside the sensed range less the largest obstacle the scenario can hold.
+Sensing edge: the swept rectangle's far corners must stay inside the sensed range less the largest obstacle the
+scenario can hold.
 
 Condition: h' + gamma h >= 0, with h' linear in tan(delta) and the commanded pedal and the observer's error bound
 in the worst direction (Alan et al. 2023). The derivatives of h are taken by central differences.
@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import footprint as fp
 from . import vehicle_spec as spec
 from .authority import peak_lateral_accel
 from .dob_cbf import SafetyFilterResult
@@ -49,28 +50,6 @@ from .dob_cbf_theory import _nn_loader, _presets, solve_qp_2d
 from .derived_model import DerivedBicycle
 from .grade_preview import G, downgrades
 from .surrogate_dynamics import BRAKE_FADE_SPEED
-
-
-def _point_segment(px, py, ax, ay, bx, by):
-    dx, dy = bx - ax, by - ay
-    w = np.clip(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy + 1e-12), 0.0, 1.0)
-    return np.hypot(px - ax - w * dx, py - ay - w * dy)
-
-
-def _segment_segment(a, b, c, d):
-    """Distance between segments ab and cd in the plane (arrays of endpoints broadcast)."""
-    def cross(ox, oy, px, py, qx, qy):
-        return (px - ox) * (qy - oy) - (py - oy) * (qx - ox)
-    d1 = cross(c[0], c[1], d[0], d[1], a[0], a[1])
-    d2 = cross(c[0], c[1], d[0], d[1], b[0], b[1])
-    d3 = cross(a[0], a[1], b[0], b[1], c[0], c[1])
-    d4 = cross(a[0], a[1], b[0], b[1], d[0], d[1])
-    crossing = (d1 * d2 < 0.0) & (d3 * d4 < 0.0)
-    m = np.minimum.reduce([_point_segment(a[0], a[1], c[0], c[1], d[0], d[1]),
-                           _point_segment(b[0], b[1], c[0], c[1], d[0], d[1]),
-                           _point_segment(c[0], c[1], a[0], a[1], b[0], b[1]),
-                           _point_segment(d[0], d[1], a[0], a[1], b[0], b[1])])
-    return np.where(crossing, 0.0, m)
 
 
 class DerivedCBFSafetyFilter:
@@ -90,13 +69,14 @@ class DerivedCBFSafetyFilter:
         self.odd_radius = float(odd_obstacle_radius)
         self.traffic_speed_err = float(traffic_speed_err)
         self.unknown_downgrade = float(unknown_downgrade)
+        if ident.get("footprint") != "box":
+            raise ValueError("these bounds were identified for another footprint (need the body rectangle)")
         b = ident["powertrains"][powertrain]
         self.s0, self.s1 = b["stop"]["s0"], b["stop"]["s1"]
         self.l0, self.l1 = b["lateral"]["l0"], b["lateral"]["l1"]
         self.sigma = b["observer"]["sigma"]
         self.e0 = b["observer"]["e0"]
-        offsets, self.r_disc = spec.footprint_discs()
-        self.a_rear, self.a_front = min(offsets), max(offsets)
+        self.x_rear, self.x_front, self.half_width = fp.body_box()
         self.max_steer = spec.MAX_ROAD_WHEEL
         self.w_max = float(np.tan(self.max_steer))
         self.steer_step = spec.STEER_RATE * self.max_steer * self.dt
@@ -205,7 +185,7 @@ class DerivedCBFSafetyFilter:
         g = 0.0
         for _ in range(4):
             s_m, _ = self._stop([v], [p], g)
-            stop = self.s0 + self.s1 * float(s_m[0]) + self.a_front
+            stop = self.s0 + self.s1 * float(s_m[0]) + self.x_front
             n = min(len(down), int(np.ceil(stop / ds)) + 1)
             g = G * float(np.max(down[:n]))
         return g
@@ -213,20 +193,21 @@ class DerivedCBFSafetyFilter:
     # -- barriers ---------------------------------------------------------------------------------
     def _h(self, X, Y, psi, s_m, t_stop, obs, dt_obs=0.0):
         """Barrier values for every obstacle (before the sampled-data margin), arrays over states."""
-        c, s = np.cos(psi), np.sin(psi)
         s_b = self.s0 + self.s1 * s_m
         lat = self.l0 + self.l1 * s_m
-        ax, ay = X + self.a_rear * c, Y + self.a_rear * s
-        bx, by = X + (self.a_front + s_b) * c, Y + (self.a_front + s_b) * s
+        front = self.x_front + s_b
+        width = self.half_width + lat
         out = []
         for ox, oy, orad, vox, voy, hx, hy, speed in obs:
             ox, oy = ox + vox * dt_obs, oy + voy * dt_obs
             reach = (speed + self.traffic_speed_err) * t_stop + 0.5 * self._traffic_accel * t_stop ** 2 \
                 if speed > 0.0 else 0.0 * t_stop
-            d = _segment_segment((ax, ay), (bx, by), (ox, oy), (ox + reach * hx, oy + reach * hy))
-            out.append(d - (orad + self.r_disc + lat))
+            ax, ay = fp.to_body(ox, oy, X, Y, psi)
+            bx, by = fp.to_body(ox + reach * hx, oy + reach * hy, X, Y, psi)
+            d = fp.segment_box(ax, ay, bx, by, self.x_rear, front, width)
+            out.append(d - orad)
         if self.sense_range > 0.0:
-            out.append(self.sense_range - (self.odd_radius + self.r_disc + self.a_front + s_b + lat))
+            out.append(self.sense_range - (self.odd_radius + np.hypot(front, width)))
         return np.array(out)
 
     # -- filter -------------------------------------------------------------------------------------

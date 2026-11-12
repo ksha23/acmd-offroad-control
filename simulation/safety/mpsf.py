@@ -327,9 +327,16 @@ class MPSFSafetyFilter:
             from . import vehicle_spec as spec
             if ident is None:
                 raise ValueError("the derived MPSF needs the identified bounds (--safety-ident)")
+            from . import footprint as fp
             if not self.dynamic_model:
                 raise ValueError("the derived MPSF is the dynamic one (--mpsf-dynamic)")
+            if ident.get("footprint") != "box":
+                raise ValueError("these bounds were identified for another footprint (need the body rectangle)")
             b = ident["powertrains"][self.powertrain]
+            self.box = fp.body_box()
+            self.rho_max = fp.corner_reach()
+            self.stop_s0 = float(b["stop"]["s0"])
+            self.stop_s1 = float(b["stop"]["s1"])
             self.tube_c1 = float(b["tube"]["c1"])
             self.tube_eps = float(b["tube"]["eps"])
             self.obstacle_buffer = float(b["tube"]["c0"])
@@ -571,7 +578,8 @@ class MPSFSafetyFilter:
                          tuple(sd.KAPPA_BRAKE), tuple(sd.KAPPA_DRIVE), sd.BRAKE_TORQUE_MAX,
                          sd.WHEEL_RADIUS, sd.BRAKE_FADE_SPEED)
         if self.derived:
-            cfg = cfg + ("derived_v1", self.powertrain, self.pedal_rate, self.kappa_max,
+            cfg = cfg + ("derived_v2_box", self.box, self.rho_max, self.stop_s0, self.stop_s1,
+                         self.powertrain, self.pedal_rate, self.kappa_max,
                          float(np.sum(self._bike.table)), tuple(self._bike.throttles))
         return hashlib.sha1(repr(cfg).encode()).hexdigest()[:12]
 
@@ -592,7 +600,7 @@ class MPSFSafetyFilter:
         x = ca.SX.sym("x", self.nx)   # X, Y, psi, u, v, r, a, s, Psi, S
         u = ca.SX.sym("u", self.nu)   # steer, alpha
         p = ca.SX.sym("p", self._np)
-        X, Y, psi, uu, r = x[0], x[1], x[2], x[3], x[5]
+        X, Y, psi, uu, r = x[0], x[1], x[2], x[3], x[5]  # noqa: E741
         s_len, turned, S = x[7], x[8], x[9]
         st, al = u[0], u[1]
         q = 5 + self._po * self.n_obs
@@ -621,6 +629,27 @@ class MPSFSafetyFilter:
 
         hx, hy = ca.cos(psi), ca.sin(psi)
 
+        def clear_rows_box(px, py, tube, x_front):
+            # Squared distance from the obstacle to the body rectangle, less the clearance squared. A vehicle's
+            # segment is represented by its point nearest the centre of mass (the check is exact).
+            from .footprint import box_sym
+            x_r, _, w = self.box
+            rows = []
+            for j in range(self.n_obs):
+                ax, ay, bx, by, orad = (p[5 + 5 * j + i] for i in range(5))
+                dx, dy = bx - ax, by - ay
+                t = ca.fmin(ca.fmax(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy + 1e-6), 0.0), 1.0)
+                ox, oy = ax + t * dx, ay + t * dy
+                qx = (ox - px) * hx + (oy - py) * hy
+                qy = -(ox - px) * hy + (oy - py) * hx
+                radius = orad + self.obstacle_buffer + self.ocp_margin + tube
+                # Between nodes: travel of the box's farthest point and the sagitta of its arc.
+                step = uu * h_stage + self.rho_max * ca.sqrt(r ** 2 + 1e-4) * h_stage
+                sag = step * ca.sqrt(r ** 2 + 1e-4) * h_stage / 8.0
+                need = ca.sqrt((radius + sag) ** 2 + (step / 2.0) ** 2)
+                rows.append(box_sym(qx, qy, x_r, x_front, w) - need ** 2)
+            return rows
+
         def clear_rows(px, py, tube):
             # Squared distance from each disc centre to the obstacle's segment,
             # less the clearance radius squared. A rock's segment is one point.
@@ -641,12 +670,23 @@ class MPSFSafetyFilter:
 
         tube = self.tube_c1 * s_len + self.tube_eps * S
         inner = r_eff - tube - self.ocp_margin
-        model.con_h_expr = ca.vertcat(*clear_rows(X, Y, tube),
-                                      inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2))
-        # Terminal: stopped at the end of the braking tail, clear and inside.
-        model.con_h_expr_e = ca.vertcat(*clear_rows(X, Y, tube),
-                                        inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2),
-                                        self.stop_speed - uu)
+        if self.derived:
+            # At the last node the rectangle reaches past the predicted stop by the identified overshoot (here
+            # on the whole path, a conservative stand-in for its braking part; the check uses the braking part).
+            x_f = self.box[1]
+            overshoot = self.stop_s0 + (self.stop_s1 - 1.0) * s_len
+            model.con_h_expr = ca.vertcat(*clear_rows_box(X, Y, tube, x_f),
+                                          inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2))
+            model.con_h_expr_e = ca.vertcat(*clear_rows_box(X, Y, tube, x_f + overshoot),
+                                            inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2),
+                                            self.stop_speed - uu)
+        else:
+            model.con_h_expr = ca.vertcat(*clear_rows(X, Y, tube),
+                                          inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2))
+            # Terminal: stopped at the end of the braking tail, clear and inside.
+            model.con_h_expr_e = ca.vertcat(*clear_rows(X, Y, tube),
+                                            inner ** 2 - ((X - cx) ** 2 + (Y - cy) ** 2),
+                                            self.stop_speed - uu)
 
         s_op, a_op = p[0], p[1]
         deviation = self.w_steer * (st - s_op) ** 2 + self.w_alpha * (al - a_op) ** 2
@@ -825,7 +865,7 @@ class MPSFSafetyFilter:
 
         # path constraints: n_obs obstacle rows + 2 lateral-authority rows;
         # terminal: n_obs obstacle rows only (no control at the terminal node).
-        no = self.n_obs * len(self.disc_offsets)            # obstacle rows (x discs)
+        no = self.n_obs * (1 if getattr(self, "derived", False) else len(self.disc_offsets))  # obstacle rows
         with_sense = self.terminal_set or self.dynamic_model
         n_sl = no + 1 if with_sense else no                 # slacked path rows
         n_e = (no * (1 + len(self.brake_samples)) + 1) if with_sense else no
@@ -1118,8 +1158,7 @@ class MPSFSafetyFilter:
             return 1.0e4
         if self.derived:
             # The footprint's front disc, at the planned position, may not reach an obstacle just past the range.
-            margin = (self.unseen_obstacle_radius + max(self.disc_offsets) + self.disc_radius
-                      + self.obstacle_buffer)
+            margin = self.unseen_obstacle_radius + self.rho_max + self.obstacle_buffer
             return max(self.sense_range - margin, 1.0)
         margin = (self.unseen_obstacle_radius + self.vehicle_radius
                   + self.ego_forward_extent + self.obstacle_buffer)
@@ -1322,15 +1361,16 @@ class MPSFSafetyFilter:
         return result(0.0, -1.0, True)
 
     # -- derived mode (--safety-derived) ---------------------------------------------------------
-    def _node_gap(self, radius, step):
-        """Radius a node must keep so the path to the next node, ``step`` away along an arc of curvature up
-        to the full-lock value, keeps ``radius``: chord half-length and sagitta."""
-        return np.sqrt((radius + self.kappa_max * step ** 2 / 8.0) ** 2 + (0.5 * step) ** 2)
-
     def _check_derived(self, z0, plan, obstacles, gravity=None):
-        """The check of ``_check`` on the derived model: the plan (steering, pedal rate) and the braking tail,
-        then straight braking with the pedal ramped down until the model stops, which it must. Every node keeps
-        its clearance widened by the gap to the next node, the ego's travel plus the obstacle's."""
+        """The check of ``_check`` on the derived model and the body rectangle.
+
+        The plan (steering, pedal rate) and the braking tail roll out on the model, then straight braking with the
+        pedal ramped down until the model stops, which it must. The prediction is extended straight past the stop
+        by the identified overshoot of its braking part (from where the final full-brake command starts). At every
+        pose, every obstacle's set must clear the rectangle by its radius plus the sideways tube, widened by the
+        gap to the next pose: the travel of the rectangle's farthest point and the obstacle's, and the sagitta of
+        the arc."""
+        from . import footprint as fp
         cmds, hs = self._substep_inputs(plan)
         a_min = max(self._bike.peak_decel(), 0.5)
         if gravity is not None:
@@ -1340,29 +1380,53 @@ class MPSFSafetyFilter:
         if xs[-1, 3] > 0.05:
             return False
         n_extra = len(xs) - 1 - len(hs)
-        t = np.concatenate([np.cumsum(hs), hs.sum() + self.cert_dt * np.arange(1, n_extra + 1)])
-        P, psi = xs[:, :2], xs[:, 2]
-        seg = np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1]))
-        turned = np.cumsum(np.abs(np.diff(np.unwrap(psi))))
-        tube = self.tube_c1 * np.cumsum(seg) + self.tube_eps * np.cumsum(seg * turned)
-        P, psi = P[1:], psi[1:]
-        # Travel to the next node (the last node's own step for the last one).
-        step = np.append(seg[1:], seg[-1]) if len(seg) > 1 else seg
-        cx, cy, r_eff, _ = self._last_sense
-        if np.any(np.hypot(P[:, 0] - cx, P[:, 1] - cy) + tube + step > r_eff):
-            return False
+        t = np.concatenate([[0.0], np.cumsum(hs), hs.sum() + self.cert_dt * np.arange(1, n_extra + 1)])
+        X, Y, psi = xs[:, 0], xs[:, 1], np.unwrap(xs[:, 2])
+        seg = np.hypot(np.diff(X), np.diff(Y))
+        s_len = np.concatenate([[0.0], np.cumsum(seg)])
+        turned = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(psi)))])
+        S = np.concatenate([[0.0], np.cumsum(seg * turned[1:])])
+        # The final full-brake command: from the last planned input that is not a full ramp down (the tail is one).
+        rates = np.concatenate([np.asarray(plan, dtype=float)[:, 1], np.full(len(hs) - len(plan) + n_extra, -1.0)])
+        k = len(rates)
+        while k > 0 and rates[k - 1] <= -0.999:
+            k -= 1
+        ext = self.stop_s0 + (self.stop_s1 - 1.0) * float(s_len[-1] - s_len[min(k, len(s_len) - 1)])
+        n_ext = max(int(np.ceil(ext / 0.1)), 1)
+        a = np.arange(1, n_ext + 1) * (ext / n_ext)
+        X = np.concatenate([X, X[-1] + a * np.cos(psi[-1])])
+        Y = np.concatenate([Y, Y[-1] + a * np.sin(psi[-1])])
+        psi = np.concatenate([psi, np.full(n_ext, psi[-1])])
+        s_len = np.concatenate([s_len, s_len[-1] + a])
+        S = np.concatenate([S, np.full(n_ext, S[-1])])
+        t_end = t[-1]
+        t = np.concatenate([t, np.full(n_ext, t_end)])
+        tube = self.obstacle_buffer + self.tube_c1 * s_len + self.tube_eps * S
+        # Travel to the next pose of the rectangle's farthest point, and the heading change.
+        dpsi = np.abs(np.diff(psi, append=psi[-1]))
+        step = np.hypot(np.diff(X, append=X[-1]), np.diff(Y, append=Y[-1])) + self.rho_max * dpsi
+        x_r, x_f, w = self.box
+        if self.sense_range > 0.0:
+            # Every point of the rectangle, with its tube, inside the sensed range less the largest unseen obstacle.
+            cx, cy, _, _ = self._last_sense
+            limit = self.sense_range - self.unseen_obstacle_radius
+            if np.any(np.hypot(X - cx, Y - cy) + self.rho_max + tube + step > limit):
+                return False
         for o in obstacles or ():
-            radius = float(o[2]) + self.disc_radius + self.obstacle_buffer
             ax, ay, bx, by = self._segment(o, t)
+            # Past the predicted stop the plant may arrive later, by up to the overshoot ratio.
+            if n_ext:
+                _, _, bx_late, by_late = self._segment(o, np.array([t_end * max(self.stop_s1, 1.0)]))
+                bx[-n_ext:], by[-n_ext:] = bx_late[0], by_late[0]
             far = np.hypot(np.diff(bx, append=bx[-1]), np.diff(by, append=by[-1]))
-            need = self._node_gap(radius + tube, step + far)
-            dx, dy = bx - ax, by - ay
-            for off in self.disc_offsets:
-                qx = P[:, 0] + off * np.cos(psi) - ax
-                qy = P[:, 1] + off * np.sin(psi) - ay
-                w = np.clip((qx * dx + qy * dy) / (dx * dx + dy * dy + 1e-6), 0.0, 1.0)
-                if np.any(np.hypot(qx - w * dx, qy - w * dy) < need):
-                    return False
+            radius = float(o[2]) + tube
+            travel = step + far
+            sag = travel * dpsi / 8.0
+            need = np.sqrt((radius + sag) ** 2 + (travel / 2.0) ** 2)
+            qax, qay = fp.to_body(ax, ay, X, Y, psi)
+            qbx, qby = fp.to_body(bx, by, X, Y, psi)
+            if np.any(fp.segment_box(qax, qay, qbx, qby, x_r, x_f, w) < need):
+                return False
         return True
 
     def _filter_derived(self, vehicle_state, s_op, a_op, obstacles, x_sense, y_sense, result):

@@ -16,7 +16,7 @@ import pytest
 from simulation.safety import vehicle_spec as spec
 
 ROOT = Path(__file__).resolve().parents[2]
-IDENT = json.loads((ROOT / "simulation/safety/ident/plant_bounds_chrono9.json").read_text())
+IDENT = json.loads((ROOT / "simulation/safety/ident/plant_bounds_chrono9_box.json").read_text())
 VP = {"M": 2573.0, "Izz": 3570.0, "Lf": 1.593, "Lr": 1.709, "h_cg": 0.65, "T": 1.8194}
 
 
@@ -26,6 +26,23 @@ def test_footprint_discs_cover_the_body_outline():
     for x in np.linspace(x0, x1, 200):
         for y in (-spec.BODY_HALF_WIDTH, 0.0, spec.BODY_HALF_WIDTH):
             assert min(np.hypot(x - c, y) for c in centres) <= r + 1e-9
+
+
+def test_box_distances_match_brute_force():
+    from simulation.safety import footprint as fp
+    x_r, x_f, w = fp.body_box()
+    rng = np.random.default_rng(3)
+    gx, gy = np.meshgrid(np.linspace(x_r, x_f, 120), np.linspace(-w, w, 60))
+    for _ in range(40):
+        a = rng.uniform(-6, 6, 2)
+        b = a + rng.uniform(-5, 5, 2)
+        t = np.linspace(0, 1, 400)[:, None]
+        pts = a + t * (b - a)
+        brute = np.min(np.hypot(pts[:, 0][:, None, None] - gx, pts[:, 1][:, None, None] - gy))
+        d = float(fp.segment_box(a[0], a[1], b[0], b[1], x_r, x_f, w))
+        assert d == pytest.approx(brute, abs=0.06)
+        assert float(fp.point_box(a[0], a[1], x_r, x_f, w)) == pytest.approx(
+            np.min(np.hypot(a[0] - gx, a[1] - gy)), abs=0.06)
 
 
 def test_simple_map_force_matches_the_engine_data():
@@ -144,8 +161,10 @@ def test_derived_mpsf_check_needs_the_stop(clay):
     z0 = np.array([0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0])
     brake_now = [(0.0, -1.0)] * f.N
     stop = f._bike.rollout_rk4(z0, np.array(brake_now), np.full(f.N, f.dt), f.cert_dt, t_tail=20.0)[-1, 0]
-    # Clearance the front disc needs at the stop: rock, disc, the tube's constant and its growth over the stop.
-    need = max(f.disc_offsets) + 1.0 + f.disc_radius + f.obstacle_buffer + f.tube_c1 * stop
+    # Clearance the front edge needs past the predicted stop: the overshoot of the braking distance, the rock,
+    # the tube over the extended path.
+    ext = f.stop_s0 + (f.stop_s1 - 1.0) * stop
+    need = f.box[1] + ext + 1.0 + f.obstacle_buffer + f.tube_c1 * (stop + ext)
     near = stop + need - 0.3
     far = stop + need + 1.0
     assert not f._check_derived(z0, brake_now, [(near, 0.0, 1.0)])

@@ -29,6 +29,8 @@ import pandas as pd
 ROOT = Path(os.environ.get('ACMD_CODE', str(Path(__file__).resolve().parents[2])))
 SOILS = ('clay', 'dirt', 'sand')
 SPEEDS = (3.0, 5.0, 7.0)
+# The certificate-shaped set spans the speeds the studies reach (the battery's overspeed mode drives at 9 m/s).
+CERT_SPEEDS = (3.0, 5.0, 7.0, 9.0, 11.0)
 STEP = 3e-3
 X_START = -92.0
 STEER_RATE = 16.0
@@ -255,7 +257,8 @@ if __name__ == '__main__':
         launches = [f'{m}_T{ms}' for m in CERT_LAUNCH for ms in CERT_HOLD_MS]
     else:
         cruise, launches = CRUISE_MANEUVERS, LAUNCHES
-    jobs = [(args.powertrain, s, v, m, out) for s in SOILS for v in SPEEDS for m in cruise]
+    speeds = CERT_SPEEDS if args.certificate else SPEEDS
+    jobs = [(args.powertrain, s, v, m, out) for s in SOILS for v in speeds for m in cruise]
     jobs += [(args.powertrain, s, 0.0, m, out) for s in SOILS for m in launches]
     if args.only:
         keep = args.only.split(',')

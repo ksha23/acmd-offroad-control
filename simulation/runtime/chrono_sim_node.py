@@ -2712,7 +2712,7 @@ def main():
                         "from the plant's spec, the rig surrogate, or the bounds in --safety-ident "
                         "(simulation/safety/README.md, Derived parameters).")
     p.add_argument("--safety-ident", type=str,
-                   default="simulation/safety/ident/plant_bounds_chrono9.json",
+                   default="simulation/safety/ident/plant_bounds_chrono9_box.json",
                    help="--safety-derived: the bounds identified on separate plant manoeuvres.")
     p.add_argument("--cbf-brake-margin", type=float, default=0.85,
                    help="DOB-CBF braking barrier: fraction of the surrogate's peak "
