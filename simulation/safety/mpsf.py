@@ -1367,10 +1367,11 @@ class MPSFSafetyFilter:
         The plan (steering, pedal rate) and the braking tail roll out on the model, then straight braking with the
         pedal ramped down until the model stops, which it must. The prediction is extended straight past the stop
         by the identified overshoot of its braking part (from where the final full-brake command starts). At every
-        pose, every obstacle's set must clear the rectangle by its radius plus the sideways tube, widened by the
-        gap to the next pose: the travel of the rectangle's farthest point and the sagitta of its arc. A vehicle's
-        set only moves forward along its heading, so between two poses it lies on the segment from its slow end at
-        the first to its fast end at the second, which the check uses."""
+        pose, every obstacle's set must clear the rectangle by the sideways tube (and a rock's radius), widened by
+        the gap to the next pose: the travel of the rectangle's farthest point and the sagitta of its arc. A
+        vehicle is its own rectangle (``footprint.traffic_box``). Its set only moves forward along its heading, so
+        between two poses it lies in its rectangle stretched from its slow position at the first to its fast
+        position at the second, which the check uses."""
         from . import footprint as fp
         cmds, hs = self._substep_inputs(plan)
         a_min = max(self._bike.peak_decel(), 0.5)
@@ -1422,14 +1423,43 @@ class MPSFSafetyFilter:
             # The obstacle's set from this pose to the next: slow end now, fast end at the next pose.
             bx = np.append(bx[1:], bx[-1])
             by = np.append(by[1:], by[-1])
-            radius = float(o[2]) + tube
             sag = step * dpsi / 8.0
+            if self._is_vehicle(o):
+                hx, hy = self._heading_of(o)
+                t_xr, t_xf, t_w = fp.traffic_box()
+                length = np.maximum((bx - ax) * hx + (by - ay) * hy, 0.0)
+                cs = fp.rect_corners(ax, ay, hx, hy, t_xr, t_xf + length, t_w)
+                qx, qy = fp.to_body(cs[..., 0], cs[..., 1], X[:, None], Y[:, None], psi[:, None])
+                dist = fp.box_quad(qx, qy, x_r, x_f, w)
+                radius = tube
+            else:
+                qax, qay = fp.to_body(ax, ay, X, Y, psi)
+                qbx, qby = fp.to_body(bx, by, X, Y, psi)
+                dist = fp.segment_box(qax, qay, qbx, qby, x_r, x_f, w)
+                radius = float(o[2]) + tube
             need = np.sqrt((radius + sag) ** 2 + (step / 2.0) ** 2)
-            qax, qay = fp.to_body(ax, ay, X, Y, psi)
-            qbx, qby = fp.to_body(bx, by, X, Y, psi)
-            if np.any(fp.segment_box(qax, qay, qbx, qby, x_r, x_f, w) < need):
+            if np.any(dist < need):
                 return False
         return True
+
+    @staticmethod
+    def _traffic_box():
+        from . import footprint as fp
+        return fp.traffic_box()
+
+    @staticmethod
+    def _is_vehicle(o):
+        return len(o) >= 6 and bool(o[3])
+
+    @staticmethod
+    def _heading_of(o):
+        """Unit heading of a vehicle obstacle: its reported heading, else its velocity's direction."""
+        if len(o) >= 7:
+            return float(np.cos(float(o[6]))), float(np.sin(float(o[6])))
+        speed = float(np.hypot(float(o[4]), float(o[5])))
+        if speed > 1e-9:
+            return float(o[4]) / speed, float(o[5]) / speed
+        return 1.0, 0.0
 
     def _filter_derived(self, vehicle_state, s_op, a_op, obstacles, x_sense, y_sense, result):
         """``_filter_dynamic`` on the derived model. The plan's inputs are (steering, pedal rate over its limit),
@@ -1459,7 +1489,19 @@ class MPSFSafetyFilter:
         steps = self._psf_steps()
         n_total = len(steps)
         t_nodes = np.concatenate([[0.0], np.cumsum(steps)])
-        segs = [np.stack(self._segment(o, t_nodes), axis=1) for o in obs]
+        segs, radii = [], []
+        t_xr, t_xf, t_w = self._traffic_box()
+        for o in obs:
+            sg = np.stack(self._segment(o, t_nodes), axis=1)
+            if self._is_vehicle(o):
+                # The planner sees a vehicle as the capsule round its centreline from rear to front edge, of radius
+                # its half-width: its rectangle lies inside, no wider. The check uses the rectangle.
+                hx, hy = self._heading_of(o)
+                sg = sg + np.array([t_xr * hx, t_xr * hy, t_xf * hx, t_xf * hy])
+                radii.append(t_w)
+            else:
+                radii.append(float(o[2]))
+            segs.append(sg)
         gravity = gravity_lookup(vehicle_state, self._bike.L, self.unknown_downgrade)
         if self._sol is not None:
             guess = list(self._sol[1:]) + [self._sol[-1]]
@@ -1475,7 +1517,7 @@ class MPSFSafetyFilter:
               for i in range(0, len(xs), self.psf_rk_steps)]
 
         def stage_p(k):
-            o_k = [c for o, sg in zip(obs, segs) for c in (*sg[k], float(o[2]))]
+            o_k = [c for rad, sg in zip(radii, segs) for c in (*sg[k], rad)]
             head = [s_op, a_op] if k < self.N else [0.0, -1.0]
             g_k = gravity(float(xw[k][0]), float(xw[k][1])) if gravity is not None else 0.0
             h_k = steps[k] if k < n_total else steps[-1]

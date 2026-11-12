@@ -15,9 +15,10 @@ travels S_model(v, p). The identified bounds put the plant's front edge within s
 place and every corner within l0 + l1 S_model of the sides (``footprint.py``: the body rectangle). The swept region
 is the body rectangle lengthened forward by that stop and widened by that drift, in the body frame now.
 
-Barrier, per obstacle: h = distance(obstacle's set, swept rectangle) - (obstacle radius + sampled-data margin). A rock's set is its centre. A vehicle's is the segment it can cover along its heading
-during the backup's stopping time, up to its speed plus the measurement error and accelerating at the drive
-capability of the believed soil. Under the backup the stop point does not move and the swept segment shrinks into
+Barrier, per obstacle: h = distance(obstacle's set, swept rectangle) - sampled-data margin. A rock's set is its disc.
+A vehicle's is its own rectangle (the same HMMWV, ``footprint.traffic_box``) stretched along its heading by what it
+can cover during the backup's stopping time, up to its speed plus the measurement error and accelerating at the
+drive capability of the believed soil. Under the backup the stop point does not move and the swept segment shrinks into
 itself, so a static obstacle's h does not decrease: the QP is feasible from h >= 0 (backup control barrier
 functions, Gurriet et al. 2018, Chen et al. 2021).
 
@@ -198,14 +199,17 @@ class DerivedCBFSafetyFilter:
         front = self.x_front + s_b
         width = self.half_width + lat
         out = []
-        for ox, oy, orad, vox, voy, hx, hy, speed in obs:
+        t_xr, t_xf, t_w = fp.traffic_box()
+        for ox, oy, orad, vox, voy, hx, hy, speed, vehicle in obs:
             ox, oy = ox + vox * dt_obs, oy + voy * dt_obs
-            reach = (speed + self.traffic_speed_err) * t_stop + 0.5 * self._traffic_accel * t_stop ** 2 \
-                if speed > 0.0 else 0.0 * t_stop
-            ax, ay = fp.to_body(ox, oy, X, Y, psi)
-            bx, by = fp.to_body(ox + reach * hx, oy + reach * hy, X, Y, psi)
-            d = fp.segment_box(ax, ay, bx, by, self.x_rear, front, width)
-            out.append(d - orad)
+            if vehicle:
+                reach = (max(speed, 0.0) + self.traffic_speed_err) * t_stop + 0.5 * self._traffic_accel * t_stop ** 2
+                cs = fp.rect_corners(ox, oy, hx, hy, t_xr, t_xf + reach, t_w)
+                qx, qy = fp.to_body(cs[..., 0], cs[..., 1], X, Y, psi)
+                out.append(fp.box_quad(qx, qy, self.x_rear, front, width))
+            else:
+                ax, ay = fp.to_body(ox, oy, X, Y, psi)
+                out.append(fp.point_box(ax, ay, self.x_rear, front, width) - orad)
         if self.sense_range > 0.0:
             out.append(self.sense_range - (self.odd_radius + np.hypot(front, width)))
         return np.array(out)
@@ -258,7 +262,8 @@ class DerivedCBFSafetyFilter:
                 hx, hy = vox / speed, voy / speed
             else:
                 hx, hy = 1.0, 0.0
-            obs.append((float(o[0]), float(o[1]), float(o[2]), vox, voy, hx, hy, speed))
+            vehicle = bool(o[3]) if len(o) >= 4 else False
+            obs.append((float(o[0]), float(o[1]), float(o[2]), vox, voy, hx, hy, speed, vehicle))
 
         g_along = self._gravity(vehicle_state, v, p)
         a_now = float(self._rate(np.array([p]), np.array([v]), g_along)[0])

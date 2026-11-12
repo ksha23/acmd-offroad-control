@@ -185,3 +185,20 @@ def test_derived_mpsf_starts_behind_a_stalled_vehicle(clay):
     plan = [(0.0, 0.75)] + [(0.0, -1.0)] * (f.N - 1)
     car = [(16.0, 0.0, 2.2, True, 0.02, 0.0, 0.0)]
     assert f._check_derived(z0, plan, car)
+
+
+def test_derived_mpsf_oncoming_vehicle_in_the_next_lane_leaves_room(clay):
+    """An oncoming vehicle 3.5 m over is its rectangle, half-width 1.28 m, so braking in our own lane certifies."""
+    pytest.importorskip("acados_template")
+    from simulation.safety.mpsf import MPSFSafetyFilter
+    t, nn = clay
+    f = MPSFSafetyFilter(VP, dynamic_model=True, derived=True, ident=IDENT, powertrain="shafts",
+                         odd_obstacle_radius=2.77, sense_range=0.0, build_solver=False)
+    f.update_terrain(t, use_terrain_nn=True)
+    f._last_sense = (0.0, 0.0, 1.0e4, f._bike.peak_decel())
+    z0 = np.array([0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0])
+    brake_now = [(0.0, -1.0)] * f.N
+    oncoming = [(12.0, 3.5, 2.2, True, -4.0, 0.0, np.pi)]
+    assert f._check_derived(z0, brake_now, oncoming)
+    # The same vehicle in our lane blocks it.
+    assert not f._check_derived(z0, brake_now, [(12.0, 0.0, 2.2, True, -4.0, 0.0, np.pi)])

@@ -1127,8 +1127,9 @@ def run_sim_node(args):
                 _powertrain = "simple_map"
             _radii = [float(r) for r in get_rock_radii(rocks)] if rocks else []
             if traffic_mgr is not None and len(traffic_mgr.vehicles):
-                from scenarios.traffic import TRAFFIC_RADIUS as _TR
-                _radii.append(float(_TR))
+                # Other vehicles are their HMMWV rectangle: an unseen one reaches its farthest corner.
+                from safety.footprint import traffic_reach as _treach
+                _radii.append(_treach())
             _odd_r = max(_radii) if _radii else 0.0
             _mpsf_kw.update(derived=True, powertrain=_powertrain, ident=_ident, odd_obstacle_radius=_odd_r,
                             traffic_speed_err=3.0 * float(args.traffic_speed_noise))
