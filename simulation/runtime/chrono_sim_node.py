@@ -98,12 +98,6 @@ from collision_detector import (
 from traffic import TrafficManager
 from latency_profile import LatencyProfile
 
-# NN tire model for terrain-aware CBF traction limits
-try:
-    from nn_tire_model import load_nn_tire_model
-except ImportError:
-    load_nn_tire_model = None
-
 
 # =============================================================================
 # Simple driver that applies external commands
@@ -294,13 +288,9 @@ def update_safety_terrain_from_command(
     safety_filter,
     command,
     last_terrain_seq: int,
-    *,
-    no_sigma_gate: bool = False,
-    hedge_k: float = 0.0,
-    use_terrain_nn: bool = False,
-    use_grip_scale: bool = False,
-) -> tuple[int, bool, float]:
-    """Apply a piggybacked terrain belief only when its command is accepted."""
+) -> tuple[int, bool]:
+    """Apply the controller's soil estimate, piggybacked on a command, once per
+    new estimate and only when its command is accepted."""
     terrain_n = getattr(command, "terrain_n", None)
     update_seq = int(getattr(command, "terrain_update_seq", 0))
     if (
@@ -308,11 +298,7 @@ def update_safety_terrain_from_command(
         or terrain_n is None
         or update_seq <= int(last_terrain_seq)
     ):
-        return int(last_terrain_seq), False, 0.0
-    sigma_deg = (
-        0.0 if no_sigma_gate
-        else float(getattr(command, "terrain_phi_sigma_deg", None) or 0.0)
-    )
+        return int(last_terrain_seq), False
     terrain = {
         "Kphi": float(getattr(command, "terrain_Kphi", None) or 0.0),
         "Kc": float(getattr(command, "terrain_Kc", None) or 0.0),
@@ -321,19 +307,8 @@ def update_safety_terrain_from_command(
         "phi": float(getattr(command, "terrain_phi_deg")),
         "k": float(getattr(command, "terrain_k", None) or 0.0),
     }
-    try:
-        safety_filter.update_terrain(
-            terrain,
-            phi_uncertainty_deg=sigma_deg,
-            n_sigma=getattr(command, "terrain_n_sigma", None),
-            hedge_k=float(hedge_k),
-            use_terrain_nn=bool(use_terrain_nn),
-            grip_scale=getattr(command, "terrain_grip_scale", None),
-            use_grip_scale=bool(use_grip_scale),
-        )
-    except TypeError:
-        safety_filter.update_terrain(terrain)
-    return update_seq, True, sigma_deg
+    safety_filter.update_terrain(terrain)
+    return update_seq, True
 
 
 def get_driver_camera_view(vehicle):
@@ -1021,159 +996,87 @@ def run_sim_node(args):
     )
 
     # ------------------------------------------------------------------
-    # CBF safety filter
+    # Safety filter
     # ------------------------------------------------------------------
     safety_filter = None
-    # Simulation time for the filter's clock (--safety-sim-clock), updated at
-    # the top of every step.
+    # Simulation time, the filter's clock for command ages, updated at the top
+    # of every step.
     _sim_clock = [0.0]
+    # The filter's soil belief (--shield-init-terrain-belief): a fixed soil
+    # ('match' is the true one), the nominal soil ('none'), or, left unset, the
+    # controller's estimate as it arrives with the commands.
+    _belief_mode = args.shield_init_terrain_belief or ""
+    _belief_soil = None
+    if _belief_mode in ("sand", "clay", "dirt"):
+        _belief_soil = _belief_mode
+    elif _belief_mode == "match":
+        _belief_soil = args.terrain
     if args.safety_filter:
         vehicle_params = get_vehicle_params_for_demo()
-
-        # Load the neural tire model that supplies the filter's traction
-        # limits. It is the same checkpoint the MPC controller uses, so the two
-        # never disagree about achievable force, and it is supervised only by
-        # the controlled single-tire Chrono SCM rig. If the import fails or the
-        # checkpoint is missing, the filter falls back to kinematic steering
-        # authority and fixed longitudinal limits. The belief soil below is the
-        # soil-blind versus terrain-aware ablation control, applied uniformly
-        # across filters.
-        _belief_mode = getattr(args, "shield_init_terrain_belief", "") or ""
-        _belief_soil = None
-        if _belief_mode in ("sand", "clay", "dirt"):
-            _belief_soil = _belief_mode
-        elif _belief_mode == "match":
-            _belief_soil = args.terrain
-
-        _nn_cbf = None
-        if args.no_safety_nn or _belief_mode == "none":
-            _why = "--no-safety-nn" if args.no_safety_nn else "--shield-init-terrain-belief none"
-            print(f"  [CBF] NN tire model disabled by {_why}; using kinematic (soil-blind) fallback")
-        elif load_nn_tire_model is not None:
-            try:
-                if _belief_soil is not None:
-                    _preset = get_terrain_preset(_belief_soil)
-                else:
-                    _prior_name = getattr(args, "terrain_belief_prior", None)
-                    _preset = (
-                        get_terrain_preset(_prior_name)
-                        if _prior_name
-                        else (terrain_config if terrain_config else get_terrain_preset(args.terrain))
-                    )
-                _tp = terrain_preset_to_internal(_preset)
-                _root = Path(__file__).resolve().parents[2]
-                _requested = Path(args.nn_model).expanduser()
-                if _requested.is_absolute() or len(_requested.parts) > 1:
-                    _model_dir = _requested if _requested.is_absolute() else _root / _requested
-                else:
-                    _model_dir = _root / "nn_models" / args.nn_model
-                _nn_cbf = load_nn_tire_model(str(_model_dir), _tp)
-                _prior_label = (_belief_soil or getattr(args, "terrain_belief_prior", None)
-                                or args.terrain)
-                print(f"  [CBF] NN tire model loaded: {args.nn_model} "
-                      f"with belief prior {_prior_label}")
-            except Exception as _e:
-                print(f"  [CBF] NN load failed ({_e}), using kinematic fallback")
-
-        # The predictive filter sizes its OCP for a fixed obstacle count, so
-        # that count is exposed: it selects the most threatening n_obstacles
-        # each step, and raising the count handles a field dense enough that
-        # several obstacles bind at once.
-        _mpsf_kw = ({"n_obstacles": int(args.mpsf_n_obstacles),
-                     "w_steer": float(args.mpsf_w_steer),
-                     "w_progress": float(args.mpsf_w_progress),
-                     # The predictive filter loads its own rig surrogate for
-                     # braking/cornering authority; the soil-blind switches
-                     # must reach it, or --no-safety-nn would disable only the
-                     # barrier filter's tire queries while this filter kept
-                     # its own.
-                     "nn_brake_authority": not (args.no_safety_nn
-                                                or _belief_mode == "none"),
-                     "sense_range": float(args.filter_sense_range),
-                     "terminal_set": bool(args.mpsf_terminal_set),
-                     "dynamic_model": bool(args.mpsf_dynamic),
-                     "psf_cost": str(args.mpsf_psf_cost),
-                     # The prediction of other vehicles allows three standard
-                     # deviations of the speed measurement's error.
-                     "traffic_speed_err": 3.0 * float(args.traffic_speed_noise),
-                     "w_rest": float(args.mpsf_w_rest),
-                     "psf_max_iter": int(args.mpsf_max_iter),
-                     "brake_margin": float(args.mpsf_brake_margin),
-                     "time_steps": _parse_time_grid(args.mpsf_time_grid)}
-                    if args.safety_flavor in ("mpsf", "predictive", "mpc_safety")
-                    else {"theory": bool(args.cbf_theory),
-                          "braking_barrier": bool(args.cbf_braking_barrier),
-                          "brake_margin": float(args.cbf_brake_margin),
-                          "gamma_brake": float(args.cbf_gamma_brake),
-                          "sense_range": float(args.filter_sense_range)})
-        if getattr(args, "safety_derived", False):
-            # Derived filters (README "Derived parameters"): the plant's powertrain as built, the bounds
-            # identified on separate plant manoeuvres, and the largest obstacle the scenario holds (the
-            # sensing edge must leave room for one just past the range).
-            import json as _json
-            _ident_path = Path(args.safety_ident).expanduser()
-            if not _ident_path.is_absolute():
-                _ident_path = Path(__file__).resolve().parents[2] / _ident_path
-            _ident = _json.loads(_ident_path.read_text())
-            try:
-                _tname = vehicle.GetVehicle().GetTransmission().GetTemplateName()
-            except Exception:  # noqa: BLE001
-                _tname = ""
-            if "Shafts" in _tname or (not _tname and not args.simple_powertrain):
-                _powertrain = "shafts"
-            elif "CVT" in _tname or (not _tname and hasattr(veh, "TransmissionModelType_AUTOMATIC_SIMPLE_CVT")):
-                _powertrain = "simple_cvt"
-            else:
-                _powertrain = "simple_map"
-            _radii = [float(r) for r in get_rock_radii(rocks)] if rocks else []
-            if traffic_mgr is not None and len(traffic_mgr.vehicles):
-                # Other vehicles are their HMMWV rectangle: an unseen one reaches its farthest corner.
-                from safety.footprint import traffic_reach as _treach
-                _radii.append(_treach())
-            _odd_r = max(_radii) if _radii else 0.0
-            _mpsf_kw.update(derived=True, powertrain=_powertrain, ident=_ident, odd_obstacle_radius=_odd_r,
-                            traffic_speed_err=3.0 * float(args.traffic_speed_noise))
-            print(f"  [SAFETY-DERIVED] powertrain={_powertrain} ({_tname or 'from flags'}) "
-                  f"ident={_ident_path.name} odd_obstacle_radius={_odd_r:.2f}")
-        safety_filter = make_safety_filter(
-            args.safety_flavor, vehicle_params=vehicle_params,
-            nn_model=_nn_cbf,
-            cbf_alpha=args.cbf_alpha,
-            obstacle_buffer=args.safety_buffer,
-            delay_steps=args.delay_steps,
-            control_dt=0.1,
-            w_long=args.cbf_w_long,
-            w_lat=args.cbf_w_lat,
-            forward_bias=args.cbf_forward_bias,
-            dob_bandwidth=args.dob_bandwidth,
-            cbf_flavor=args.cbf_flavor,
+        # Every number the filters take comes from the plant's specification,
+        # the rig surrogate (--nn-model) or the bounds identified on separate
+        # plant manoeuvres (--safety-ident); simulation/safety/README.md lists
+        # them. From the scenario they take the plant's powertrain as built and
+        # the largest obstacle the scenario holds (the sensing edge must leave
+        # room for one just past the range).
+        import json as _json
+        _root = Path(__file__).resolve().parents[2]
+        _ident_path = Path(args.safety_ident).expanduser()
+        if not _ident_path.is_absolute():
+            _ident_path = _root / _ident_path
+        _ident = _json.loads(_ident_path.read_text())
+        _requested = Path(args.nn_model).expanduser()
+        if _requested.is_absolute() or len(_requested.parts) > 1:
+            _model_dir = _requested if _requested.is_absolute() else _root / _requested
+        else:
+            _model_dir = _root / "nn_models" / args.nn_model
+        try:
+            _tname = vehicle.GetVehicle().GetTransmission().GetTemplateName()
+        except Exception:  # noqa: BLE001
+            _tname = ""
+        if "Shafts" in _tname or (not _tname and not args.simple_powertrain):
+            _powertrain = "shafts"
+        elif "CVT" in _tname or (not _tname and hasattr(veh, "TransmissionModelType_AUTOMATIC_SIMPLE_CVT")):
+            _powertrain = "simple_cvt"
+        else:
+            _powertrain = "simple_map"
+        _radii = [float(r) for r in get_rock_radii(rocks)] if rocks else []
+        if traffic_mgr is not None and len(traffic_mgr.vehicles):
+            # Other vehicles are their HMMWV rectangle: an unseen one reaches its farthest corner.
+            from safety.footprint import traffic_reach as _treach
+            _radii.append(_treach())
+        _odd_r = max(_radii) if _radii else 0.0
+        _filter_kw = dict(
+            ident=_ident, powertrain=_powertrain, odd_obstacle_radius=_odd_r,
+            sense_range=float(args.filter_sense_range),
+            # The prediction of other vehicles allows three standard deviations
+            # of the speed measurement's error.
+            traffic_speed_err=3.0 * float(args.traffic_speed_noise),
+            nn_model_dir=str(_model_dir),
             teleop_delay=initial_control_delay,
-            stale_cmd_timeout=args.stale_cmd_timeout,
-            **_mpsf_kw,
-        )
-        delay_msg = (f", teleop_delay={initial_control_delay*1000:.0f}ms"
-                     if initial_control_delay > 0 else "")
-        print(f"  [SAFETY] {args.safety_flavor} filter enabled: alpha={args.cbf_alpha}, "
-              f"buffer={args.safety_buffer}m, flavor={args.cbf_flavor}{delay_msg}")
-        print(f"  [SAFETY-CFG] sense_range={args.filter_sense_range} "
-              f"sim_clock={bool(args.safety_sim_clock)} "
-              f"mpsf_terminal_set={bool(args.mpsf_terminal_set)} "
-              f"mpsf_dynamic={bool(args.mpsf_dynamic)} "
-              f"mpsf_psf_cost={args.mpsf_psf_cost} "
-              f"mpsf_grid={args.mpsf_time_grid or '0.1x20'} "
-              f"cbf_braking_barrier={bool(args.cbf_braking_barrier)} "
-              f"cbf_theory={bool(args.cbf_theory)} "
+            stale_cmd_timeout=args.stale_cmd_timeout)
+        if args.safety_flavor == "mpsf":
+            _filter_kw.update(n_obstacles=int(args.mpsf_n_obstacles),
+                              time_steps=_parse_time_grid(args.mpsf_time_grid),
+                              psf_max_iter=int(args.mpsf_max_iter))
+        else:
+            _filter_kw.update(control_dt=0.1, gamma=float(args.cbf_gamma))
+        safety_filter = make_safety_filter(args.safety_flavor, vehicle_params, **_filter_kw)
+        safety_filter.set_clock(lambda: _sim_clock[0])
+        print(f"  [SAFETY] {args.safety_flavor} filter enabled: powertrain={_powertrain} "
+              f"({_tname or 'from flags'}) ident={_ident_path.name} "
+              f"odd_obstacle_radius={_odd_r:.2f} sense_range={args.filter_sense_range} "
+              f"belief={_belief_mode or 'estimate'} "
               f"traffic_speed_noise={args.traffic_speed_noise}", flush=True)
-        if args.safety_sim_clock and hasattr(safety_filter, "set_clock"):
-            safety_filter.set_clock(lambda: _sim_clock[0])
+        if args.safety_flavor == "mpsf":
+            print(f"  [SAFETY] mpsf grid={args.mpsf_time_grid or '0.1x20'} "
+                  f"max_iter={args.mpsf_max_iter} n_obstacles={args.mpsf_n_obstacles}", flush=True)
+        else:
+            print(f"  [SAFETY] dob_cbf gamma={args.cbf_gamma}", flush=True)
 
-        # Terrain-aware ablation arm: the belief soil is pushed into every
-        # filter exposing update_terrain, so the predictive filter picks up
-        # surrogate-derived braking and cornering authority. The call is a
-        # no-op for the barrier QP, whose tire model was conditioned on the
-        # same soil above. The soil-blind arms -- the empty default and 'none'
-        # -- skip this and leave both filters at nominal grip.
-        if _belief_soil is not None and hasattr(safety_filter, "update_terrain"):
+        # A fixed soil belief is set once here. Left unset, the filter keeps
+        # the nominal soil until the controller's estimate arrives.
+        if _belief_soil is not None:
             try:
                 _bp = get_terrain_preset(_belief_soil)
                 _belief_rt = {
@@ -1184,10 +1087,10 @@ def run_sim_node(args):
                     "k": float(_bp.get("janosi_shear", _bp.get("k", 0.0))),
                 }
                 safety_filter.update_terrain(_belief_rt)
-                print(f"  [SAFETY] terrain-aware belief injected: soil={_belief_soil} "
+                print(f"  [SAFETY] soil belief: {_belief_soil} "
                       f"n={_belief_rt['n']:.2f} phi={_belief_rt['phi']:.1f}deg")
             except Exception as _e:  # noqa: BLE001
-                print(f"  [SAFETY] belief injection failed ({_e})")
+                print(f"  [SAFETY] soil belief failed ({_e})")
 
     # ------------------------------------------------------------------
     # Trajectory markers (visual only)
@@ -1592,23 +1495,19 @@ def run_sim_node(args):
     def accept_command_metadata(command, sim_stamp=None) -> None:
         """Advance safety metadata at the command-actuation boundary.
 
-        With --safety-sim-clock the command age is measured in simulation time
-        from ``sim_stamp``, the simulation time at which the command entered
-        the delay line, instead of from the controller's wall-clock stamp.
+        The filter's clock is simulation time, so a command's arrival is
+        recorded when it actuates. A fixed soil belief ignores the
+        controller's estimate.
         """
         nonlocal last_terrain_seq, terrain_update_count
-        if safety_filter is not None and args.safety_sim_clock and sim_stamp is not None:
-            safety_filter.update_command_age(sim_stamp)
-        elif safety_filter is not None and command.wall_time > 0:
-            safety_filter.update_command_age(command.wall_time)
-        last_terrain_seq, applied, sigma_deg = update_safety_terrain_from_command(
+        if safety_filter is not None and (sim_stamp is not None or command.wall_time > 0):
+            safety_filter.update_command_age()
+        if _belief_mode:
+            return
+        last_terrain_seq, applied = update_safety_terrain_from_command(
             safety_filter,
             command,
             last_terrain_seq,
-            no_sigma_gate=bool(getattr(args, "shield_no_sigma_gate", False)),
-            hedge_k=float(getattr(args, "shield_hedge_k", 0.0)),
-            use_terrain_nn=bool(getattr(args, "shield_terrain_nn", False)),
-            use_grip_scale=bool(getattr(args, "shield_grip_scale", False)),
         )
         if applied:
             terrain_update_count += 1
@@ -1617,7 +1516,6 @@ def run_sim_node(args):
                     f"  [SHIELD-TERRAIN] update #{terrain_update_count}: "
                     f"n={command.terrain_n:.3f} "
                     f"phi={command.terrain_phi_deg:.2f}\N{DEGREE SIGN} "
-                    f"sigma_phi={sigma_deg:.2f}\N{DEGREE SIGN} "
                     f"class={command.terrain_class}",
                     flush=True,
                 )
@@ -1626,13 +1524,12 @@ def run_sim_node(args):
     steer_diverge_t = 0.0   # accumulated time the actual steer angle defies the command
     steer_broken = False    # latched once the front steering/suspension breaks
     applied_steer = 0.0     # physics-rate steering-actuator state (rate-limited cmd)
-    STEER_RATE_MAX = 16.0   # ~8 rad/s road wheel; matches the CBF QP's max_steer_rate
+    STEER_RATE_MAX = 16.0   # ~8 rad/s road wheel; the filters' steering rate (vehicle_spec.STEER_RATE)
     applied_alpha = 0.0     # physics-rate throttle/brake-actuator state (alpha in [-1,1])
-    ALPHA_RATE_MAX = 8.0    # throttle/brake rate (1/s); matches the CBF QP's max_alpha_rate
+    ALPHA_RATE_MAX = 8.0    # throttle/brake rate (1/s); the filters' pedal rate (vehicle_spec.PEDAL_RATE)
     step_count = 0
     sim_diag_file = None
     sim_diag_writer = None
-    _grade_log = None
     sim_diag_interval = 0.1
     last_sim_diag_time = -sim_diag_interval
     if args.sim_diag_csv:
@@ -1684,10 +1581,6 @@ def run_sim_node(args):
     _t_loop_total = 0.0; _t_state_extract = 0.0; _t_rt_sleep = 0.0
     _t_report_steps = 0; _sensor_calls = 0
 
-    # Where the safety filter's one-way delay comes from (--safety-delay-source).
-    _dsrc = getattr(args, "safety_delay_source", "oracle")
-    _tau_hat = None   # measured command age, smoothed
-    _tau_log = []     # (injected, used) delay at each filter call, for the run summary
     while True:
         _t_loop_start = wall_time.time()
         time_chrono = vehicle.GetSystem().GetChTime()
@@ -1701,14 +1594,9 @@ def run_sim_node(args):
             manual_delay_s = float(args.manual_input_delay)
             camera_delay_s = float(args.camera_input_delay)
         if safety_filter is not None:
-            # Delay-blind ablation: the filter is not told the delay even though
-            # the channels are still delayed by the profile.
-            if getattr(args, "safety_delay_blind", False):
-                safety_filter.set_teleop_delay(0.0)
-            elif _dsrc == "measured":
-                safety_filter.set_teleop_delay(_tau_hat or 0.0)
-            else:
-                safety_filter.set_teleop_delay(control_delay_s)
+            # A delay above zero means the commands come over a link, which
+            # arms the filter's stale-command brake.
+            safety_filter.set_teleop_delay(control_delay_s)
         if args.synthetic_operator:
             # The operator perceives its own state through the video channel.
             driver.perception_delay = camera_delay_s
@@ -1774,14 +1662,6 @@ def run_sim_node(args):
             if released_manual is not None:
                 delayed_manual_inputs[0], delayed_manual_inputs[1], \
                     delayed_manual_inputs[2] = released_manual[:3]
-                if _dsrc == "measured":
-                    # Command age at release, in simulation time, through a first-order smoother.
-                    _age = time_chrono - released_manual[3]
-                    if _tau_hat is None:
-                        _tau_hat = _age
-                    else:
-                        _gain = step_size / (float(args.safety_delay_tc) + step_size)
-                        _tau_hat += _gain * (_age - _tau_hat)
                 # A delayed manual command actuating IS a command arriving over
                 # the link: record it so the filter's stale-command emergency
                 # brake is live in replay and synthetic-operator runs. During
@@ -1790,10 +1670,7 @@ def run_sim_node(args):
                 # exceeds its staleness timeout -- previously this mechanism
                 # was dead code in every latency study.
                 if safety_filter is not None:
-                    if args.safety_sim_clock:
-                        safety_filter.update_command_age(released_manual[3])
-                    else:
-                        safety_filter.update_command_age(wall_time.time())
+                    safety_filter.update_command_age()
             driver_inputs.m_steering = delayed_manual_inputs[0]
             driver_inputs.m_throttle = delayed_manual_inputs[1]
             driver_inputs.m_braking = delayed_manual_inputs[2]
@@ -1803,14 +1680,6 @@ def run_sim_node(args):
         # Safety filter at ~10Hz
         sf_interval = max(1, int(1.0 / (10.0 * step_size)))  # 10 Hz, matching MPC rate
         if safety_filter is not None and step_count % sf_interval == 0:
-            # Set right before the call so the filter's own command-age smoother cannot override it.
-            if not getattr(args, "safety_delay_blind", False):
-                if _dsrc == "measured":
-                    safety_filter.set_teleop_delay(_tau_hat or 0.0)
-                elif _dsrc == "oracle_exact":
-                    safety_filter.set_teleop_delay(manual_delay_s if _manual_mode else control_delay_s)
-            _tau_log.append((manual_delay_s if _manual_mode else control_delay_s,
-                             float(getattr(safety_filter, "_teleop_delay", float("nan")))))
             chassis_body = vehicle.GetChassisBody()
             veh_pos = chassis_body.GetPos()
             veh_rot = chassis_body.GetRot()
@@ -1828,7 +1697,7 @@ def run_sim_node(args):
                     dist = np.sqrt((rock_pos[i, 0] - veh_pos.x)**2 +
                                    (rock_pos[i, 1] - veh_pos.y)**2)
                     if dist < float(args.filter_sense_range):
-                        # 4th element False => static rock (CBF prefers steering)
+                        # 4th element False => a rock, a disc of its radius.
                         all_obstacles.append((rock_pos[i, 0], rock_pos[i, 1], rock_rad[i], False))
             if traffic_mgr is not None:
                 for st in traffic_mgr.states():
@@ -1837,10 +1706,9 @@ def run_sim_node(args):
                     if args.traffic_speed_noise > 0.0:
                         speed += traffic_noise_rng.normal(0.0, args.traffic_speed_noise)
                     if (ox - veh_pos.x) ** 2 + (oy - veh_pos.y) ** 2 < float(args.filter_sense_range) ** 2:
-                        # 4th element True => vehicle (CBF weights braking equally).
+                        # 4th element True => another vehicle, its HMMWV rectangle.
                         # 5th and 6th: its measured planar velocity, 7th its
-                        # heading. The filters that predict obstacle motion read
-                        # them and the published ones ignore them.
+                        # heading, which the filters' predictions of it start from.
                         all_obstacles.append((ox, oy, orad, True,
                                               speed * np.cos(st["psi"]),
                                               speed * np.sin(st["psi"]),
@@ -1885,15 +1753,6 @@ def run_sim_node(args):
             driver_inputs.m_steering = sf_result.steering
             driver_inputs.m_throttle = sf_result.throttle
             driver_inputs.m_braking = sf_result.braking
-            if grade_profile is not None and args.sim_diag_csv:
-                # The stopping deceleration the filter assumed at each call, for
-                # the terrain-preview study.
-                if _grade_log is None:
-                    _grade_log = open(Path(args.sim_diag_csv).with_name("grade_preview.csv"), "w", buffering=1)
-                    _grade_log.write("time,x,z,speed,a_brake_used\n")
-                _grade_log.write(f"{time_chrono:.3f},{veh_pos.x:.3f},{veh_pos.z:.3f},"
-                                 f"{veh_state['u']:.3f},"
-                                 f"{float(getattr(safety_filter, '_a_h_used', float('nan'))):.4f}\n")
         elif safety_filter is not None and safety_filter._last_result is not None:
             cached = safety_filter._last_result
             if cached.was_modified:
@@ -2290,12 +2149,6 @@ def run_sim_node(args):
         print(f"  [IMU] analytical model used (no IMU sensor configured): "
               f"accel={_imu_fb['accel_steps']} gyro={_imu_fb['gyro_steps']} step(s).")
 
-    if _tau_log:
-        _tl = np.array(_tau_log)
-        print(f"  [DELAY-SOURCE] {_dsrc}{' blind' if getattr(args, 'safety_delay_blind', False) else ''}: "
-              f"injected mean {np.nanmean(_tl[:, 0]) * 1000:.1f} ms, used mean {np.nanmean(_tl[:, 1]) * 1000:.1f} ms, "
-              f"mean abs diff {np.nanmean(np.abs(_tl[:, 1] - _tl[:, 0])) * 1000:.1f} ms, calls {len(_tl)}")
-
     # Safety filter summary
     if safety_filter is not None:
         diag = safety_filter.get_diagnostics()
@@ -2392,14 +2245,6 @@ def main():
                    help="Target speed for the synthetic operator (default: --speed).")
     p.add_argument("--synthetic-operator-klat", type=float, default=0.55)
     p.add_argument("--synthetic-operator-kpsi", type=float, default=1.15)
-    p.add_argument("--safety-delay-blind", action="store_true",
-                   help="Force the safety filter's teleop_delay to 0 (delay-blind) "
-                        "even under a latency profile, for the blind-vs-aware "
-                        "latency ablation.")
-    p.add_argument("--safety-delay-source", choices=["oracle", "oracle_exact", "measured"], default="oracle",
-                   help="Where the safety filter's one-way command delay comes from. oracle (the paper): the injected delay, set once per step, after which DOB-CBF's wall-clock command-age smoother pulls it to about 0.85 of the injected value in replay and synthetic-operator runs. oracle_exact: the injected delay, set right before every filter call. measured: the filter never sees the injected delay and uses the age of operator commands at release, in simulation time, smoothed with --safety-delay-tc. measured covers operator commands only.")
-    p.add_argument("--safety-delay-tc", type=float, default=0.2,
-                   help="Time constant (s) of the measured command-age smoother.")
     p.add_argument("--replay-cmds", type=str, default="",
                    help="Counterfactual replay: drive the ego from a recorded "
                         "operator command trace CSV (steering_op/throttle_op/"
@@ -2605,193 +2450,76 @@ def main():
     p.add_argument("--rock-spawn-clear", type=float, default=12.0,
                    help="Radius (m) of the rock-free circle around the spawn.")
 
-    # Safety filter
+    # Safety filter (simulation/safety/README.md)
     p.add_argument("--safety-filter", action="store_true",
                    help="Enable the safety filter (flavor controlled by --safety-flavor)")
     p.add_argument("--safety-flavor", type=str, default="dob_cbf",
                    choices=["dob_cbf", "mpsf"],
-                   help="Safety filter: dob_cbf is the pointwise DOB-CBF-QP; "
-                        "mpsf is the predictive Model Predictive Safety "
-                        "Filter, least-restrictive over a horizon.")
-    p.add_argument("--shield-no-sigma-gate", action="store_true",
-                   help="Ablation arm: zero the controller's friction-angle "
-                        "uncertainty before the safety filter reads it, which "
-                        "is equivalent to --shield-sigma-mode off.")
-    p.add_argument("--shield-hedge-k", type=float, default=0.0,
-                   help="Belief-robust safety authority: evaluate the filter's "
-                        "acceleration and braking limits at the pessimistic "
-                        "soil quantile n_hat - k*sigma_n, taking sigma_n from "
-                        "ControlCommand.terrain_n_sigma, so an uncertain "
-                        "estimate widens the stopping buffer. 0 disables it "
-                        "and the authority follows the point estimate.")
-    p.add_argument("--shield-terrain-nn", action="store_true",
-                   help="Condition the safety filter's own tire queries -- "
-                        "barrier dynamics, steering authority, and the "
-                        "traction speed limit -- on the live terrain estimate "
-                        "rather than the model's nominal soil.")
-    p.add_argument("--shield-grip-scale", action="store_true",
-                   help="Scale the filter's control authority by the measured "
-                        "grip ratio from the controller's force-map adapter "
-                        "(ControlCommand.terrain_grip_scale). This covers soil "
-                        "whose grip departs from what its Bekker exponent "
-                        "implies, which the exponent estimate alone cannot see.")
-    p.add_argument("--mpsf-w-progress", type=float, default=0.0,
-                   help="MPSF only: progress weight. >0 penalizes crawling below "
-                        "a 2 m/s floor so the filter threads a dense field instead "
-                        "of stalling (when a safe thread exists); the hard "
-                        "obstacle constraint still forces a stop when none does. "
-                        "0 = brake-primary default (strict intent preservation). "
-                        "Note: >0 also nudges the vehicle up to the floor speed in "
-                        "obstacle-free driving, so keep it 0 unless dense-field "
-                        "threading is required.")
-    p.add_argument("--mpsf-w-steer", type=float, default=1.0,
-                   help="MPSF only: steering-deviation cost weight (throttle "
-                        "weight is 1.0). Lower (<1) makes weaving cheaper than "
-                        "braking, so it threads dense fields instead of stopping; "
-                        "1.0 keeps braking primary (intent-preserving default).")
-    p.add_argument("--mpsf-n-obstacles", type=int, default=3,
-                   help="MPSF only: number of obstacles the predictive OCP sizes "
-                        "for. The filter feeds it the most-threatening "
-                        "(on-path-ahead) n at each step, so a larger world is "
-                        "handled by selection; raise this for dense fields where "
-                        "several obstacles bind simultaneously. Solve cost grows "
-                        "sub-linearly (~4 ms at 16).")
-    p.add_argument("--mpsf-terminal-set", action="store_true",
-                   help="MPSF only: the terminal-set formulation. The plan must end "
-                        "where straight-line braking at the soil's margined "
-                        "deceleration stops clear of every known obstacle and "
-                        "inside the sensed region, deviation is charged on the "
-                        "executed input, and the horizon-tied speed funnel is off. "
-                        "Safety then does not depend on the horizon length. The "
-                        "default is the published formulation.")
-    p.add_argument("--mpsf-dynamic", action="store_true",
-                   help="MPSF only: the standard predictive safety filter on the "
-                        "surrogate dynamic bicycle (simulation/safety/surrogate_dynamics.py, "
-                        "the NMPC's model): the published cost, constraints tightened by "
-                        "the model's error against the plant, and a terminal set from "
-                        "which straight braking stops clear. Independent of "
-                        "--mpsf-terminal-set.")
-    p.add_argument("--mpsf-psf-cost", choices=["horizon", "first"], default="first",
-                   help="With --mpsf-dynamic: 'first' (default) charges deviation on the "
-                        "executed input only (the textbook predictive safety filter), "
-                        "'horizon' on every planned stage (the published MPSF's cost).")
+                   help="Safety filter: dob_cbf is the minimum-deviation barrier QP "
+                        "with a disturbance observer; mpsf is the model predictive "
+                        "safety filter.")
+    p.add_argument("--safety-ident", type=str,
+                   default="simulation/safety/ident/plant_bounds_chrono9_box.json",
+                   help="The filters' bounds, identified on separate plant manoeuvres "
+                        "(benchmarking/safety_ident/).")
+    p.add_argument("--shield-init-terrain-belief", type=str, default="",
+                   choices=["", "none", "match", "sand", "clay", "dirt"],
+                   help="The safety filter's soil belief. 'match' is the true soil "
+                        "(--terrain), a soil name forces that soil, 'none' keeps the "
+                        "nominal soil (dry sand, the firmest in the study), so the "
+                        "filter is soil-blind. Left empty, the filter starts on the "
+                        "nominal soil and takes the controller's estimate as it "
+                        "arrives with the commands.")
+    p.add_argument("--cbf-gamma", type=float, default=3.0,
+                   help="DOB-CBF only: decay rate (1/s) of the discrete-time barrier "
+                        "condition, a free design parameter.")
     p.add_argument("--mpsf-time-grid", type=str, default="",
-                   help="MPSF only: horizon time grid as comma-separated DTxN "
-                        "groups, e.g. 0.1x10,0.3x10 for 4 s in 20 steps. The first "
-                        "step should equal the 0.1 s filter period. Default 0.1x20.")
+                   help="MPSF only: planned horizon as comma-separated DTxN groups, "
+                        "e.g. 0.1x10,0.3x10 for 4 s in 20 steps. The first step "
+                        "should equal the 0.1 s filter period. Default 0.1x20. A free "
+                        "design parameter: a braking tail follows the plan, and the "
+                        "check of every plan keeps safety.")
     p.add_argument("--mpsf-max-iter", type=int, default=20,
-                   help="--mpsf-dynamic: SQP iterations per call (a free design parameter: the check "
-                        "keeps safety, fewer iterations mean more steps on the kept plan).")
-    p.add_argument("--mpsf-w-rest", type=float, default=0.01,
-                   help="MPSF terminal set only: deviation weight on inputs after "
-                        "the first, relative to the first.")
-    p.add_argument("--mpsf-brake-margin", type=float, default=0.85,
-                   help="MPSF terminal set only: fraction of the surrogate's peak "
-                        "braking deceleration the plan may use. The plant reaches "
-                        "87 to 94 percent of it under full brake.")
+                   help="MPSF only: SQP iterations per call, a free design parameter "
+                        "(fewer iterations mean more steps on the kept plan).")
+    p.add_argument("--mpsf-n-obstacles", type=int, default=3,
+                   help="MPSF only: how many obstacles the OCP holds. The filter "
+                        "feeds it the most threatening ones at each step, and the "
+                        "check of its plan tests every obstacle.")
     p.add_argument("--traffic-speed-noise", type=float, default=0.0,
                    help="Standard deviation (m/s) of the Gaussian error on each "
                         "traffic vehicle's speed as the safety filter receives it, "
-                        "drawn per vehicle per filter step. The dynamic-model MPSF "
-                        "predicts other vehicles with three of these as its speed "
-                        "error bound. 0 (default) gives the filter the true speed.")
-    p.add_argument("--cbf-theory", action="store_true",
-                   help="DOB-CBF only: the textbook DOB-CBF (simulation/safety/"
-                        "dob_cbf_theory.py): high-order CBF on the distance with real "
-                        "roots, braking-distance and sensing-edge barriers on the "
-                        "surrogate's soil braking, a disturbance observer whose error "
-                        "bound tightens every row, hard constraints, full braking with "
-                        "steering held when infeasible. The default is the published "
-                        "filter.")
-    p.add_argument("--cbf-braking-barrier", action="store_true",
-                   help="DOB-CBF only: add the braking-distance barrier rows "
-                        "(gap - v^2/(2 a_h) on lane obstacles and on the sensing "
-                        "edge), with a_h the margined surrogate braking deceleration "
-                        "on the believed soil.")
-    p.add_argument("--safety-derived", action="store_true",
-                   help="Filters with no hand-set numbers: --cbf-theory or --mpsf-dynamic with every number "
-                        "from the plant's spec, the rig surrogate, or the bounds in --safety-ident "
-                        "(simulation/safety/README.md, Derived parameters).")
-    p.add_argument("--safety-ident", type=str,
-                   default="simulation/safety/ident/plant_bounds_chrono9_box.json",
-                   help="--safety-derived: the bounds identified on separate plant manoeuvres.")
-    p.add_argument("--cbf-brake-margin", type=float, default=0.85,
-                   help="DOB-CBF braking barrier: fraction of the surrogate's peak "
-                        "braking deceleration the barrier assumes.")
-    p.add_argument("--cbf-gamma-brake", type=float, default=3.0,
-                   help="DOB-CBF braking barrier: class-K gain (1/s) of the "
-                        "first-order braking rows.")
+                        "drawn per vehicle per filter step. Both filters predict "
+                        "other vehicles with three of these as the speed error "
+                        "bound. 0 (default) gives the filter the true speed.")
     p.add_argument("--filter-sense-range", type=float, default=30.0,
                    help="Centre distance (m) within which the safety filter is "
                         "given obstacles. The published runs used 30 m.")
     p.add_argument("--filter-grade-preview", type=str, default="none",
                    choices=["none", "imu", "map", "lidar"],
-                   help="Textbook DOB-CBF and dynamic MPSF: what the filter knows of "
-                        "the grade. none (default): flat ground. imu: the chassis "
-                        "pitch now, held over the whole stop. map: terrain heights "
-                        "along the heading out to 40 m, read from SCM (an oracle "
-                        "elevation map), and the steepest downgrade over the stop. "
-                        "lidar: the same heights as a roof lidar 2.1 m up sees "
-                        "them, ground hidden behind a crest unknown and a height "
-                        "error of 0.02 m + 0.2 percent of range; the filter takes "
-                        "unknown ground as its steepest admissible downgrade.")
+                   help="What the safety filter knows of the grade. none (default): "
+                        "flat ground. imu: the chassis pitch now, held over the "
+                        "whole stop. map: terrain heights along the heading out to "
+                        "40 m, read from SCM (an oracle elevation map), and the "
+                        "steepest downgrade over the stop. lidar: the same heights "
+                        "as a roof lidar 2.1 m up sees them, ground hidden behind a "
+                        "crest unknown and a height error of 0.02 m + 0.2 percent of "
+                        "range; the filter takes unknown ground as its steepest "
+                        "admissible downgrade.")
     p.add_argument("--filter-preview-pitch-bias-deg", type=float, default=0.0,
                    help="--filter-grade-preview lidar only: a pitch error (deg, nose "
                         "up positive) in the pose the map is built in. A height s "
                         "metres ahead reads s tan(bias) higher, so a positive bias "
                         "makes a downgrade look shallower.")
-    p.add_argument("--safety-sim-clock", action="store_true",
-                   help="Run the safety filter's command-age smoother, stale-command "
-                        "brake and steering lag on simulation time instead of wall "
-                        "time, so repeated runs do not depend on machine load. "
-                        "Command ages are then measured in simulation time.")
-    p.add_argument("--shield-init-terrain-belief", type=str, default="",
-                   choices=["", "none", "match", "sand", "clay", "dirt"],
-                   help="Set every safety filter's terrain belief uniformly at "
-                        "construction, which is the control for the soil-blind "
-                        "versus terrain-aware ablation. The empty default "
-                        "leaves each filter at its own setting: dob_cbf "
-                        "conditions its tire model on the terrain preset while "
-                        "mpsf stays soil-blind. 'none' makes every filter "
-                        "soil-blind (dob_cbf kinematic, mpsf nominal grip). "
-                        "'match' makes every filter terrain-aware to "
-                        "--terrain, and naming a soil forces that belief. Each "
-                        "terrain-aware setting also calls update_terrain, so "
-                        "mpsf takes up surrogate-derived braking and cornering "
-                        "authority.")
-    p.add_argument("--shield-sigma-mode", type=str, default="off",
-                   choices=["tighten", "inflate", "both", "off"],
-                   help="How the estimator's friction-angle uncertainty acts "
-                        "on the safety filter. The default, off, runs the "
-                        "filter on its initial terrain belief. tighten, "
-                        "inflate, and both are the arms of the "
-                        "uncertainty-gating ablation.")
-    p.add_argument("--shield-sigma-buffer-gain", type=float, default=0.05,
-                   help="Metres of extra obstacle buffer per degree of phi_sigma.")
-    # Parameters shared by both safety filters.
-    p.add_argument("--shield-horizon", type=int, default=12,
-                   help="Prediction horizon steps (latency adds more dynamically).")
-    p.add_argument("--cbf-alpha", type=float, default=5.0)
-    p.add_argument("--safety-buffer", type=float, default=0.25)
-    p.add_argument("--delay-steps", type=int, default=5)
-    p.add_argument("--cbf-w-long", type=float, default=0.06)
-    p.add_argument("--cbf-w-lat", type=float, default=0.50)
-    p.add_argument("--cbf-forward-bias", type=float, default=3.0)
-    p.add_argument("--dob-bandwidth", type=float, default=10.0)
-    p.add_argument("--cbf-flavor", type=str, default="balance",
-                   choices=["balance", "steer_priority", "throttle_priority"])
     p.add_argument("--nn-model", type=str, default="tire_force_static",
-                   help="Directory under nn_models/ holding the tire model the "
-                        "safety filter queries for traction limits.")
-    p.add_argument("--no-safety-nn", action="store_true",
-                   help="Run the safety filter without its neural tire model; "
-                        "dob_cbf then uses kinematic steering authority and "
-                        "fixed longitudinal limits.")
+                   help="Directory under nn_models/ holding the rig surrogate the "
+                        "safety filter's vehicle model uses.")
     p.add_argument("--teleop-delay", type=float, default=0.0,
                    help="Initial one-way teleop delay estimate in seconds "
                         "(0 = local, auto-measured from cmd timestamps)")
     p.add_argument("--stale-cmd-timeout", type=float, default=2.0,
-                   help="Auto-brake if no command received for this many seconds")
+                   help="Over a teleop link, brake if no command arrives for this "
+                        "many seconds")
 
     args = p.parse_args()
     run_sim_node(args)

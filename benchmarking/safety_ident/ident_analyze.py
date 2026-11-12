@@ -1,4 +1,4 @@
-"""Identify the derived filters' error bounds from the plant manoeuvres (PLAN.md, "Identification").
+"""Identify the safety filters' error bounds from the plant manoeuvres (PLAN.md, "Identification").
 
     python ident_analyze.py <out dir> <run dir> [<run dir> ...]
 
@@ -10,7 +10,7 @@ Split. Within each (powertrain, soil, manoeuvre family) stratum the runs are shu
 first half (rounded up) identifies, the rest validates. Every bound is the tightest of its form that covers every
 identification point (a linear program minimising its mean), and its coverage is reported on the held-out half.
 
-Model: derived_model.py (rig surrogate, the plant's powertrain from its spec, motion resistance = the surrogate's
+Model: vehicle_model.py (rig surrogate, the plant's powertrain from its spec, motion resistance = the surrogate's
 force at zero slip), the true soil.
 
 Stop overshoot and drift (both filters). At the instant the full-brake command starts, from the plant's speed and
@@ -30,7 +30,7 @@ whole plant rectangle then lies within cover of that one predicted rectangle. Fo
 matched pose, s its path length, S the integral over the path of the accumulated heading change.
 
 DOB-CBF observer, at the filter's 0.1 s period. d_k = (u_k+1 - u_k) / dt - mean model du/dt over the interval.
-The observer of dob_cbf_theory.py (k dt = 0.5) runs on the logged speed and the model's du/dt, started converged.
+The DOB-CBF's observer (k dt = 0.5) runs on the logged speed and the model's du/dt, started converged.
 Identified: the largest observer error (sigma) and the largest |d| (e0). Also reported: the largest lateral body
 speed and the kinematic model's largest yaw-rate error.
 """
@@ -49,7 +49,7 @@ for p in (CODE, CODE / 'simulation', CODE / 'simulation' / 'shared'):
 from param_consistency import get_terrain_preset, get_vehicle_params_for_demo, terrain_preset_to_internal  # noqa: E402
 from simulation.safety import footprint as fp  # noqa: E402
 from simulation.safety import vehicle_spec as spec  # noqa: E402
-from simulation.safety.derived_model import DerivedBicycle  # noqa: E402
+from simulation.safety.vehicle_model import SurrogateBicycle  # noqa: E402
 from simulation.tire_models.nn_tire_model import load_nn_tire_model  # noqa: E402
 
 SEED = 20261112
@@ -66,7 +66,7 @@ def model(plant, soil):
     if key not in _models:
         t = terrain_preset_to_internal(get_terrain_preset(soil))
         nn = load_nn_tire_model(str(CODE / 'nn_models' / 'tire_force_static'), t)
-        b = DerivedBicycle(nn, VEH, plant)
+        b = SurrogateBicycle(nn, VEH, plant)
         b.set_terrain(t)
         _models[key] = b
     return _models[key]

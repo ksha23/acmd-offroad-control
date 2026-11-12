@@ -1,4 +1,4 @@
-"""Plant manoeuvres for identifying the derived filters' error bounds (PLAN.md, "Identification").
+"""Plant manoeuvres for identifying the safety filters' error bounds (PLAN.md, "Identification").
 
 Plant only, no filter, flat SCM. The HMMWV accelerates straight to a cruise speed under a speed controller,
 holds it, then runs one open-loop manoeuvre (or, for a launch, starts the manoeuvre from rest). Commands pass

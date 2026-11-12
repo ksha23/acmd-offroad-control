@@ -73,8 +73,8 @@ class _SafetySpy:
     def __init__(self):
         self.updates = []
 
-    def update_terrain(self, terrain, **kwargs):
-        self.updates.append((terrain, kwargs))
+    def update_terrain(self, terrain):
+        self.updates.append(terrain)
 
 
 def test_safety_terrain_metadata_advances_once_when_command_is_accepted():
@@ -82,9 +82,6 @@ def test_safety_terrain_metadata_advances_once_when_command_is_accepted():
     command = SimpleNamespace(
         terrain_n=0.93,
         terrain_update_seq=7,
-        terrain_n_sigma=0.04,
-        terrain_grip_scale=0.88,
-        terrain_phi_sigma_deg=1.5,
         terrain_Kphi=2.1e6,
         terrain_Kc=3.2e4,
         terrain_c=1200.0,
@@ -92,39 +89,14 @@ def test_safety_terrain_metadata_advances_once_when_command_is_accepted():
         terrain_k=0.02,
     )
 
-    sequence, applied, sigma = update_safety_terrain_from_command(
-        safety, command, 6, hedge_k=1.5, use_terrain_nn=True,
-        use_grip_scale=True,
-    )
-    duplicate_sequence, duplicate_applied, _ = update_safety_terrain_from_command(
+    sequence, applied = update_safety_terrain_from_command(safety, command, 6)
+    duplicate_sequence, duplicate_applied = update_safety_terrain_from_command(
         safety, command, sequence
     )
 
-    assert (sequence, applied, sigma) == (7, True, 1.5)
+    assert (sequence, applied) == (7, True)
     assert (duplicate_sequence, duplicate_applied) == (7, False)
     assert len(safety.updates) == 1
-    terrain, kwargs = safety.updates[0]
+    terrain = safety.updates[0]
     assert terrain["n"] == 0.93
-    assert kwargs["n_sigma"] == 0.04
-    assert kwargs["hedge_k"] == 1.5
-    assert kwargs["use_terrain_nn"] is True
-    assert kwargs["grip_scale"] == 0.88
-    assert kwargs["use_grip_scale"] is True
-
-
-def test_safety_terrain_metadata_can_zero_the_sigma_gate():
-    safety = _SafetySpy()
-    command = SimpleNamespace(
-        terrain_n=0.7, terrain_update_seq=1, terrain_n_sigma=0.2,
-        terrain_grip_scale=None, terrain_phi_sigma_deg=4.0,
-        terrain_Kphi=1.0, terrain_Kc=2.0, terrain_c=3.0,
-        terrain_phi_deg=20.0, terrain_k=0.01,
-    )
-
-    _, applied, sigma = update_safety_terrain_from_command(
-        safety, command, -1, no_sigma_gate=True
-    )
-
-    assert applied is True
-    assert sigma == 0.0
-    assert safety.updates[0][1]["phi_uncertainty_deg"] == 0.0
+    assert terrain["phi"] == 25.0

@@ -93,21 +93,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--terrain", default="clay")
     p.add_argument("--time", type=float, default=20.0)
     p.add_argument("--mesh-resolution", type=float, default=0.08)
-    p.add_argument("--safety-buffer", type=float, default=0.25)
-    p.add_argument("--shield-horizon", type=int, default=12)
-    p.add_argument("--cbf-alpha", type=float, default=5.0,
-                   help="CBF class-K gain; higher = filter acts later/closer = "
-                        "less intrusive (conservative=5.0, permissive~15).")
-    p.add_argument("--cbf-forward-bias", type=float, default=3.0,
-                   help="Barrier forward shift (m); lower = reacts closer = less "
-                        "intrusive (conservative=3.0, permissive~1.0).")
     p.add_argument("--shield-init-terrain-belief", type=str, default="",
                    choices=["", "none", "match", "sand", "clay", "dirt"],
-                   help="Soil-blind against terrain-aware ablation: 'none' forces "
-                        "every filter soil-blind; 'match' or a named soil makes "
-                        "them terrain-aware, which gives MPSF surrogate braking "
-                        "and cornering authority. '' leaves each filter at its "
-                        "own default belief.")
+                   help="The filter's soil belief (chrono_sim_node): 'none' keeps "
+                        "the nominal soil (soil-blind), 'match' or a named soil "
+                        "makes it soil-aware. A replay run has no controller, so "
+                        "'' is soil-blind too.")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--timeout", type=float, default=400.0)
     p.add_argument("--base-port", type=int, default=11200)
@@ -149,14 +140,10 @@ class Task:
     terrain: str
     time_s: float
     mesh: float
-    buffer: float
-    horizon: int
     timeout: float
     cell: str = ""          # baseline-matching key (scenario or recorded round)
     profile: str = ""       # sampled latency-profile JSON; overrides the fixed delay
-    cbf_alpha: float = 5.0          # CBF class-K gain (higher = less intrusive)
-    cbf_forward_bias: float = 3.0   # barrier forward shift, m (lower = less intrusive)
-    terrain_belief: str = ""        # soil-blind vs terrain-aware ablation belief
+    terrain_belief: str = ""        # the filter's soil belief
 
 
 def _build_cmd(t: Task) -> list[str]:
@@ -171,16 +158,13 @@ def _build_cmd(t: Task) -> list[str]:
     ]
     if t.profile:
         # Replay under a time-varying profile (variable command-channel delay);
-        # the filter auto-measures command staleness and is therefore delay-aware.
+        # the stale-command brake is armed whenever the delay is above zero.
         prof = t.profile if Path(t.profile).is_absolute() else str(PROJECT_ROOT / t.profile)
         cmd += ["--latency-profile-json", prof]
     elif t.delay > 0:
         cmd += ["--manual-input-delay", str(t.delay), "--teleop-delay", str(t.delay)]
     if t.filter_name != "none":
-        cmd += ["--safety-filter", "--safety-flavor", t.filter_name,
-                "--safety-buffer", str(t.buffer), "--shield-horizon", str(t.horizon),
-                "--cbf-alpha", str(t.cbf_alpha),
-                "--cbf-forward-bias", str(t.cbf_forward_bias)]
+        cmd += ["--safety-filter", "--safety-flavor", t.filter_name]
         if t.terrain_belief:
             cmd += ["--shield-init-terrain-belief", t.terrain_belief]
     # Plant-configuration contract: run.py exports HIL_SIM_EXTRA (the deployed
@@ -304,7 +288,6 @@ def _main(args) -> None:
                 run_dir = out_dir / "raw" / f"{idx:03d}_{name}_{filt}"
                 tasks.append(Task(idx, filt, delay, args.base_port + 2 * idx, str(run_dir),
                                   trace_f, preset0, args.terrain, args.time, args.mesh_resolution,
-                                  args.safety_buffer, args.shield_horizon,
                                   args.timeout, cell=name, profile=args.latency_profile_json))
                 idx += 1
     else:
@@ -331,10 +314,7 @@ def _main(args) -> None:
                             run_dir = out_dir / "raw" / f"{idx:03d}_{preset}_{filt}_d{delay:.2f}_t{thr:.2f}"
                             tasks.append(Task(idx, filt, delay, args.base_port + 2 * idx, str(run_dir),
                                               traces[thr], preset, args.terrain, args.time, args.mesh_resolution,
-                                              args.safety_buffer, args.shield_horizon,
                                               args.timeout, cell=f"{preset}@d{delay:.2f}@t{thr:.2f}",
-                                              cbf_alpha=args.cbf_alpha,
-                                              cbf_forward_bias=args.cbf_forward_bias,
                                               terrain_belief=args.shield_init_terrain_belief))
                             idx += 1
         else:
@@ -344,7 +324,6 @@ def _main(args) -> None:
                         run_dir = out_dir / "raw" / f"{idx:03d}_{preset}_{filt}_d{delay:.2f}"
                         tasks.append(Task(idx, filt, delay, args.base_port + 2 * idx, str(run_dir),
                                           trace, preset, args.terrain, args.time, args.mesh_resolution,
-                                          args.safety_buffer, args.shield_horizon,
                                           args.timeout, cell=f"{preset}@d{delay:.2f}"))
                         idx += 1
 

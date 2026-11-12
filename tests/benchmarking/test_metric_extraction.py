@@ -183,8 +183,7 @@ class HilSimExtraContractTest(unittest.TestCase):
         import benchmarking.convoy_counterfactual_eval as convoy
         t = convoy.Task(idx=0, filter_name="none", delay=0.0, sim_port=1,
                         run_dir="/tmp/r", trace="/tmp/t.csv", convoy="jam",
-                        terrain="dirt", time_s=1.0, mesh=0.1, buffer=1.0,
-                        horizon=18, timeout=1.0)
+                        terrain="dirt", time_s=1.0, mesh=0.1, timeout=1.0)
         os.environ["HIL_SIM_EXTRA"] = self.DEPLOYED
         try:
             cmd = convoy._build_cmd(t)
@@ -193,20 +192,6 @@ class HilSimExtraContractTest(unittest.TestCase):
         self.assertEqual(cmd[-1], "--simple-powertrain")
         self.assertNotIn("--dob-ki", cmd)
         self.assertNotIn("--ff-drag-surrogate", cmd)
-
-    def test_latency_build_cmd_appends_simulator_flags(self):
-        import benchmarking.latency_awareness_ablation as lat
-        t = lat.Task(idx=0, trace="/tmp/t.csv", convoy="jam", variant="none",
-                     delay=0.3, throttle=0.5, run_dir="/tmp/r", sim_port=1,
-                     terrain="dirt", time_s=1.0, mesh=0.1, buffer=1.0,
-                     timeout=1.0, cell="c")
-        os.environ["HIL_SIM_EXTRA"] = self.DEPLOYED
-        try:
-            cmd = lat._build_cmd(t)
-        finally:
-            del os.environ["HIL_SIM_EXTRA"]
-        self.assertEqual(cmd[-1], "--simple-powertrain")
-        self.assertNotIn("--dob-max", cmd)
 
 
 if __name__ == "__main__":

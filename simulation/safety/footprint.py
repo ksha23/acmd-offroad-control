@@ -1,4 +1,4 @@
-"""The vehicle's footprint as its body rectangle, and distances to it (``--safety-derived``).
+"""The vehicle's footprint as its body rectangle, and distances to it.
 
 The rectangle is the collision mesh's outline (``vehicle_spec``), in the body frame of the chassis centre of
 mass: x in [x_rear, x_front] along the heading, y in [-half_width, half_width]. Distances are Euclidean and zero

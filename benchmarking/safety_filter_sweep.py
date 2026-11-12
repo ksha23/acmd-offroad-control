@@ -75,11 +75,6 @@ def parse_args() -> argparse.Namespace:
                    help="Cross each filter with both planner-aware and "
                         "planner-blind obstacle cases, which is the four-variant "
                         "design the manuscript reports.")
-    p.add_argument("--shield-horizon", type=int, default=18)
-    p.add_argument("--safety-buffer", type=float, default=0.50,
-                   help="Extra obstacle clearance buffer passed to the DOB-CBF "
-                        "filter. Default 0.50 m gives it a practical guard band "
-                        "beyond the geometric vehicle-clearance proxy.")
     p.add_argument("--timeout", type=float, default=200.0)
     p.add_argument("--base-port", type=int, default=7800)
     p.add_argument("--workers", type=int, default=6,
@@ -135,11 +130,7 @@ def _run_one(task: _Task) -> RunResult:
 def extra_args_for(flavor: str, blind: bool, args: argparse.Namespace) -> list[str]:
     extra: list[str] = []
     if flavor != "none":
-        extra += [
-            "--safety-filter", "--safety-flavor", flavor,
-            "--shield-horizon", str(args.shield_horizon),
-            "--safety-buffer", str(args.safety_buffer),
-        ]
+        extra += ["--safety-filter", "--safety-flavor", flavor]
     if blind:
         extra.append("--mpc-blind-obstacles")
     return extra
@@ -321,13 +312,8 @@ def _run(args: argparse.Namespace) -> None:
         summary,
         [
             "Noise policy: sensor noise enabled in every run.",
-            f"Safety buffer: {args.safety_buffer:g} m beyond the geometric "
-            "vehicle-clearance proxy; collision truth is Chrono body contact.",
-            "Residual collisions are diagnosed from the per-run "
-            "`cbf_filter_log.csv` and trajectory, which distinguish a "
-            "short-horizon braking response from insufficient steering "
-            "commitment: DOB-CBF carries an explicit reactive steering layer "
-            "and can clear a head-on obstacle without long-horizon optimization.",
+            "Collision truth is Chrono body contact. The filters' clearances "
+            "come from the identified bounds (simulation/safety/README.md).",
         ],
     )
     plot_figures(out_dir / "results.csv", out_dir)

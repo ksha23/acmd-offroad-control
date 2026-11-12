@@ -20,9 +20,10 @@ four parts behind fixed interfaces:
   hypotheses — no pose datum, no terrain truth, no force or torque sensing. It
   publishes gated snapshots and otherwise holds a labelled low-grip prior
   (`simulation/estimators/`).
-- **Safety**: a swappable filter layer — DOB-CBF, the deployed reactive
-  default, and MPSF, the predictive alternative — with explicit one-way
-  command-delay compensation (`simulation/safety/`).
+- **Safety**: a swappable filter layer, a DOB-CBF barrier QP (the default)
+  and an MPSF, both acting on the measured state with every number taken from
+  the plant's specification, the rig surrogate or bounds identified on separate
+  plant manoeuvres (`simulation/safety/`).
 - **Latency environment**: replayed traffic from the measurement-grounded
   N-HiTS 5G generator (`data/latency_profiles/5g_nhits_geforce.json`, traces in
   `data/5g_generated/`), applied to the command uplink and the camera
@@ -90,9 +91,12 @@ conda run -n scm-terrain python benchmarking/make_paper_figures.py
 conda run -n scm-terrain python benchmarking/verify_provenance_chain.py
 ```
 
-The paper tier consists of 9 commands; its dry-run manifest
-(`--tier paper --dry-run`) is the authority for the run count and the exact
-command lines:
+The paper's numbers come from the code at tag `acmd2026-published`. Later
+commits replace its safety filters (`simulation/safety/HISTORY.md`), so the
+safety studies below then run on the current filters, and the delay-awareness
+ablation, which tested the published filter's delay compensation, is only at the
+tag. The paper tier's dry-run manifest (`--tier paper --dry-run`) is the
+authority for its commands, run counts and exact command lines:
 
 1. `tire_models` — neural surrogate versus calibrated Pacejka and TMeasy
    tracking (405 paired runs per arm);
@@ -106,8 +110,7 @@ command lines:
 5. `grit_speed` — the GRIT terrain-adaptive speed matrix (Figure 3);
 6. `safety` — the planner-blind and planner-aware native-contact safety matrix;
 7. `convoy_cf` — paired convoy counterfactual replays;
-8. `latency_awareness` — the delay-awareness dose response;
-9. `teleop_battery` — the teleoperation failure-mode battery (Table 4,
+8. `teleop_battery` — the teleoperation failure-mode battery (Table 4,
    Figure 4).
 
 Shorter forms:

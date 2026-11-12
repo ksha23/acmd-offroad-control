@@ -290,41 +290,12 @@ Examples:
                         "to the sim; omitted here leaves the sim default.")
     p.add_argument("--safety-flavor", type=str, default="dob_cbf",
                    choices=["dob_cbf", "mpsf"],
-                   help="dob_cbf -- the pointwise DOB-CBF-QP; mpsf -- the "
-                        "predictive Model Predictive Safety Filter, which is "
-                        "least-restrictive over a horizon and takes its "
-                        "braking and cornering authority from the single-tire "
-                        "rig force surrogate at the estimated soil.")
-    p.add_argument("--no-safety-nn", action="store_true",
-                   help="Run the plant-side safety filter without its neural "
-                        "tire model, which falls back to kinematic steering "
-                        "authority and fixed longitudinal limits. This is the "
-                        "ablation arm isolating the tire model's contribution.")
-    p.add_argument("--shield-no-sigma-gate", action="store_true",
-                   help="Ablation arm: zero the friction-angle uncertainty as "
-                        "it crosses into the plant node, which is equivalent "
-                        "to --shield-sigma-mode off.")
-    p.add_argument("--shield-sigma-mode", type=str, default="off",
-                   choices=["tighten", "inflate", "both", "off"],
-                   help="How the safety filter uses the estimator's friction-"
-                        "angle uncertainty. The default, off, runs the filter "
-                        "on its initial terrain belief. tighten, inflate, and "
-                        "both are the arms of the uncertainty-gating ablation.")
-    p.add_argument("--shield-sigma-buffer-gain", type=float, default=0.05,
-                   help="Metres of extra obstacle buffer per degree of phi_sigma.")
-    p.add_argument("--shield-horizon", type=int, default=12)
+                   help="dob_cbf: the minimum-deviation barrier QP with a "
+                        "disturbance observer. mpsf: the model predictive safety "
+                        "filter (simulation/safety/README.md).")
     p.add_argument("--mpc-blind-obstacles", action="store_true",
                    help="Make the MPC controller ignore obstacles — safety shield "
                         "becomes the sole collision-avoider.")
-    p.add_argument("--cbf-alpha", type=float, default=1.0)
-    p.add_argument("--safety-buffer", type=float, default=0.25)
-    p.add_argument("--delay-steps", type=int, default=5)
-    p.add_argument("--cbf-w-long", type=float, default=0.15)
-    p.add_argument("--cbf-w-lat", type=float, default=0.50)
-    p.add_argument("--cbf-forward-bias", type=float, default=1.5)
-    p.add_argument("--dob-bandwidth", type=float, default=10.0)
-    p.add_argument("--cbf-flavor", type=str, default="balance",
-                   choices=["balance", "steer_priority", "throttle_priority"])
     p.add_argument("--teleop-delay", type=float, default=0.0,
                    help="Initial one-way teleop delay in seconds (0 = local)")
     p.add_argument("--stale-cmd-timeout", type=float, default=2.0,
@@ -465,38 +436,20 @@ Examples:
     p.add_argument("--hedge-k", type=float, default=0.0,
                    help="Controller-side uncertainty-aware envelope: g-g grip "
                         "limits at n_hat - k*sigma_n (0 = off).")
-    p.add_argument("--shield-hedge-k", type=float, default=0.0,
-                   help="Sim-side belief-robust safety authority: filter "
-                        "accel/brake limits at n_hat - k*sigma_n (0 = off).")
-    p.add_argument("--shield-terrain-nn", action="store_true",
-                   help="Forwarded: filter NN queries conditioned on live terrain.")
     p.add_argument("--shield-init-terrain-belief", type=str, default="",
                    choices=["", "none", "match", "sand", "clay", "dirt"],
                    help="Forwarded: the filters' soil belief (see chrono_sim_node).")
-    # Forwarded: the reformulated filters (see chrono_sim_node for each).
-    p.add_argument("--mpsf-terminal-set", action="store_true")
-    p.add_argument("--mpsf-dynamic", action="store_true")
-    p.add_argument("--mpsf-psf-cost", type=str, default="")
+    # Forwarded to the plant node (see chrono_sim_node for each).
     p.add_argument("--mpsf-time-grid", type=str, default="")
-    p.add_argument("--mpsf-w-rest", type=float, default=None)
-    p.add_argument("--mpsf-brake-margin", type=float, default=None)
-    p.add_argument("--cbf-braking-barrier", action="store_true")
-    p.add_argument("--cbf-theory", action="store_true")
     p.add_argument("--traffic-speed-noise", type=float, default=None)
-    p.add_argument("--cbf-brake-margin", type=float, default=None)
-    p.add_argument("--cbf-gamma-brake", type=float, default=None)
+    p.add_argument("--cbf-gamma", type=float, default=None)
     p.add_argument("--filter-sense-range", type=float, default=None)
     p.add_argument("--filter-grade-preview", type=str, default=None)
     p.add_argument("--filter-preview-pitch-bias-deg", type=float, default=None)
     p.add_argument("--terrain-grade", type=float, default=None)
     p.add_argument("--terrain-grade-start-x", type=float, default=None)
-    p.add_argument("--safety-sim-clock", action="store_true")
-    p.add_argument("--safety-derived", action="store_true")
     p.add_argument("--mpsf-max-iter", type=int, default=None)
     p.add_argument("--safety-ident", type=str, default=None)
-    p.add_argument("--shield-grip-scale", action="store_true",
-                   help="Forwarded: filter authority scaled by the adapter's "
-                        "measured grip ratio.")
     p.add_argument("--ukf-model-dir", default=None,
                    help="Override the single-tire rig checkpoint the force-map "
                         "estimators evaluate (default: "
@@ -653,38 +606,14 @@ Examples:
         sim_cmd.extend(["--safety-flavor", args.safety_flavor])
         if args.mpsf_n_obstacles is not None:
             sim_cmd.extend(["--mpsf-n-obstacles", str(args.mpsf_n_obstacles)])
-        if float(args.shield_hedge_k) > 0.0:
-            sim_cmd.extend(["--shield-hedge-k", str(args.shield_hedge_k)])
-        if args.shield_terrain_nn:
-            sim_cmd.append("--shield-terrain-nn")
-        if args.shield_grip_scale:
-            sim_cmd.append("--shield-grip-scale")
         if args.shield_init_terrain_belief:
             sim_cmd.extend(["--shield-init-terrain-belief", args.shield_init_terrain_belief])
-        for flag in ("mpsf_terminal_set", "mpsf_dynamic", "cbf_braking_barrier",
-                     "cbf_theory", "safety_sim_clock", "safety_derived"):
-            if getattr(args, flag):
-                sim_cmd.append("--" + flag.replace("_", "-"))
-        for flag in ("mpsf_time_grid", "mpsf_psf_cost", "mpsf_w_rest", "mpsf_brake_margin",
-                     "cbf_brake_margin",
-                     "cbf_gamma_brake", "filter_sense_range", "traffic_speed_noise",
+        for flag in ("mpsf_time_grid", "cbf_gamma", "filter_sense_range", "traffic_speed_noise",
                      "filter_grade_preview", "terrain_grade", "terrain_grade_start_x",
                      "filter_preview_pitch_bias_deg", "safety_ident", "mpsf_max_iter"):
             value = getattr(args, flag)
             if value not in (None, ""):
                 sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])
-        if args.no_safety_nn:
-            sim_cmd.append("--no-safety-nn")
-        sim_cmd.extend(["--safety-buffer", str(args.safety_buffer)])
-        # Barrier-QP parameters. They are forwarded unconditionally; the
-        # predictive filter ignores the ones it does not define.
-        sim_cmd.extend(["--cbf-alpha", str(args.cbf_alpha)])
-        sim_cmd.extend(["--delay-steps", str(args.delay_steps)])
-        sim_cmd.extend(["--cbf-w-long", str(args.cbf_w_long)])
-        sim_cmd.extend(["--cbf-w-lat", str(args.cbf_w_lat)])
-        sim_cmd.extend(["--cbf-forward-bias", str(args.cbf_forward_bias)])
-        sim_cmd.extend(["--dob-bandwidth", str(args.dob_bandwidth)])
-        sim_cmd.extend(["--cbf-flavor", args.cbf_flavor])
 
     # IMU sensor args
     if args.no_imu:

@@ -1,1736 +1,457 @@
-"""Reactive minimum-deviation safety filter for the HMMWV.
+"""DOB-CBF: a minimum-deviation barrier QP over the steering and the pedal, with a disturbance observer whose error
+bound tightens every row. Every number comes from the plant's specification (``vehicle_spec``), the rig
+surrogate (``vehicle_model``) or the bounds identified on separate plant manoeuvres (``ident/``). The README lists
+them, with the free design parameters.
 
-A disturbance-observer-based control barrier function (DOB-CBF) filter. Each
-call solves one quadratic program that minimises deviation from the incoming
-command subject to a barrier constraint per obstacle, so the command passes
-through untouched whenever those constraints are inactive and is altered only
-by the amount they demand.
+Model. Kinematic bicycle, X' = v cos(psi), Y' = v sin(psi), psi' = v tan(delta) / L, v' = a(p, v) + d, with the
+road-wheel angle delta and the pedal p as the inputs over one period: delta jumps to its command, p moves to its
+command at the plant's rate limit. a(p, v) is the vehicle model's speed rate (rig surrogate, the plant's
+powertrain, the soil's motion resistance, braking fading out at a standstill, gravity on a previewed grade).
 
-Elements:
-1. **Weighted ellipsoidal barrier**: a heading-aligned ellipse makes lateral
-   escape nearer in barrier space than braking, so the QP steers around a
-   static obstacle instead of stopping in front of it.
-2. **Disturbance observer**: a first-order observer estimates the lumped
-   unmodelled longitudinal acceleration (compaction drag, grade, sinkage
-   resistance) and feeds it into the barrier's second derivative, so the
-   constraint accounts for deceleration the nominal model does not predict.
-3. **Directional bias**: a forward-shifted ellipse centre concentrates the
-   grip-limited margin ahead of the vehicle, where the threat is.
-4. **Terrain-aware speed limiting**: the neural tire model's lateral-force
-   prediction sets the speed at which an evasive manoeuvre remains available.
-   That model is supervised only by the controlled single-tire Chrono SCM rig.
-5. **Latency compensation**: a discrete predictor with derivative feedback
-   estimates the state reached across the actuation delay.
+Backup. Straight (delta = 0), the pedal ramped to full brake at the rate limit and held to a stop. On the model it
+travels S_model(v, p). The identified bounds put the plant's front edge within s0 + s1 S_model of its starting
+place and every corner within l0 + l1 S_model of the sides (``footprint.py``: the body rectangle). The swept region
+is the body rectangle lengthened forward by that stop and widened by that drift, in the body frame now.
 
-Mathematical Formulation
-------------------------
-State: ``x = [x, y, psi, v, beta]`` where beta is the current road-wheel angle.
+Barrier, per obstacle: h = distance(obstacle's set, swept rectangle) - sampled-data margin. A rock's set is its disc.
+A vehicle's is its own rectangle (the same HMMWV, ``footprint.traffic_box``) stretched along its heading by what it
+can cover during the backup's stopping time, up to its speed plus the measurement error and accelerating at the
+drive capability of the believed soil. Under the backup the stop point does not move and the swept segment shrinks into
+itself, so a static obstacle's h does not decrease: the QP is feasible from h >= 0 (backup control barrier
+functions, Gurriet et al. 2018, Chen et al. 2021).
 
-Barrier function (per obstacle):
-    ``h(x) = (p - p_obs)^T P (p - p_obs) - r_safe^2``
+Sensing edge: the swept rectangle's far corners must stay inside the sensed range less the largest obstacle the
+scenario can hold.
 
-where ``P = R(psi)^T diag(w_long, w_lat) R(psi)`` is a heading-aligned
-ellipsoidal weight matrix.  Setting ``w_long < w_lat`` (e.g. 1/100 vs 1/9)
-elongates the safe zone along the heading -> lateral escape is "closer" in
-barrier-space -> the QP naturally prefers steering over braking.
+Condition: the discrete-time one of a filter whose input is held over its period (Agrawal and Sreenath 2017),
+h at the end of the period >= (1 - gamma dt) h now, with the observer's error bound in the worst direction (Alan et
+al. 2023). The end state comes from the model with the pedal ramped to its command at the rate limit. h is concave
+in the pedal (flat until the throttle overcomes the soil's resistance, then falling), so the two secants through
+the box's ends and the held pedal, as two rows, lie below it. The wheel angle enters through the end heading,
+linearly (a central difference).
 
-Control inputs: ``u = [dbeta (steering angle rate), alpha (normalized throttle)]``
+Sampled-data margin: h can dip between samples. The margin is 1/2 L dt^2, with L the largest |h''| over the period
+at the corners of the input box (second differences along the model), taken off h at both ends.
 
-The QP minimizes deviation from the driver's desired input:
-    min  ||u - u_des||^2
-    s.t. -psi1_i @ u <= psi0_i   for each obstacle i
-         actuator limits
-
-DOB update:
-    ``hdv0 = p0v + a_v * v``   (velocity disturbance estimate)
-    ``dp0v = -a_v * (f_nom(v, alpha) + hdv0)``
-
-Usage:
-    from simulation.safety import CBFSafetyFilter
-
-    cbf = CBFSafetyFilter(vehicle_params, nn_casadi=nn_model)
-
-    # In loop:
-    result = cbf.filter(
-        desired_steering, desired_throttle, desired_brake,
-        vehicle_state, obstacles, terrain_roughness
-    )
+QP: identity cost on the inputs scaled by their ranges (tan(delta) over tan of full lock, the pedal). Infeasible:
+the backup's first period (straight, the pedal ramped down). There is no state projection over a teleop delay: the
+filter runs on the vehicle and acts on the measured state.
 """
+from __future__ import annotations
 
-import os
-import numpy as np
-from scipy.optimize import minimize
-from typing import List, Tuple, Optional, Dict
-from dataclasses import dataclass
 import time
+from pathlib import Path
+
+import numpy as np
+
+from . import footprint as fp
+from . import vehicle_spec as spec
+from .common import SafetyFilterResult, nn_loader, nominal_terrain
+from .grade_preview import G, downgrades
+from .vehicle_model import BRAKE_FADE_SPEED, SurrogateBicycle
 
 
-@dataclass
-class SafetyFilterResult:
-    """Output of the CBF safety filter."""
-    steering: float       # Filtered steering input [-1, 1]
-    throttle: float       # Filtered throttle input [0, 1]
-    braking: float        # Filtered braking input [0, 1]
-    was_modified: bool    # True if inputs were changed by safety filter
-    active_constraints: int  # Number of active CBF constraints
-    solve_time_ms: float  # QP solve time in milliseconds
-    v_max_terrain: float  # Terrain-limited max safe speed (m/s)
-    safety_margin: float  # Minimum h(x) across all obstacles
-    dob_norm: float = 0.0 # Norm of DOB disturbance estimate
+def solve_qp_2d(z0, A, b):
+    """argmin ||z - z0||^2 subject to A z <= b, z in R^2, exactly.
 
-
-class DelayCompensator:
+    The minimum is z0 if feasible, else the projection onto one constraint line
+    or a vertex of two. Returns None when the set is empty.
     """
-    Discrete predictor for latency compensation.
+    z0 = np.asarray(z0, dtype=float)
+    tol = 1e-7
+    if len(b) == 0 or np.all(A @ z0 <= b + tol):
+        return z0
+    best, best_d = None, np.inf
+    for i in range(len(b)):
+        a = A[i]
+        n2 = float(a @ a)
+        if n2 < 1e-12:
+            continue
+        z = z0 - (float(a @ z0) - b[i]) / n2 * a
+        if np.all(A @ z <= b + tol):
+            d = float(np.sum((z - z0) ** 2))
+            if d < best_d:
+                best, best_d = z, d
+    for i in range(len(b)):
+        for j in range(i + 1, len(b)):
+            M = np.array([A[i], A[j]])
+            if abs(np.linalg.det(M)) < 1e-10:
+                continue
+            z = np.linalg.solve(M, np.array([b[i], b[j]]))
+            if np.all(A @ z <= b + tol):
+                d = float(np.sum((z - z0) ** 2))
+                if d < best_d:
+                    best, best_d = z, d
+    return best
 
-    Holds a FIFO of issued control commands and runs a discrete predictor with
-    derivative and proportional feedback, so that under a known actuation delay
-    the filter reasons about the command the vehicle is executing now rather
-    than the one just issued.
 
-    Args:
-        delay_steps: Number of time steps of actuation delay
-        dt: Control loop time step (s)
-        k1: Derivative feedback gain (default: 0.6)
-        k2: Proportional feedback gain (default: 2.0)
+def peak_lateral_accel(nn, terrain: dict, fz_f: float, fz_r: float, mass: float) -> float:
+    """Peak lateral acceleration (m/s^2) over a slip-angle sweep at the static loads, from the rig surrogate.
+
+    Returns 0.0 when no query in the sweep is finite.
     """
-
-    def __init__(self, delay_steps: int = 5, dt: float = 0.02,
-                 k1: float = 0.6, k2: float = 2.0):
-        self.td = max(int(delay_steps), 0)
-        self.dt = dt
-        self.k1 = k1
-        self.k2 = k2
-
-        from collections import deque
-        maxlen = self.td + 1
-        self.throttle_hist = deque([0.0] * maxlen, maxlen=maxlen)
-        self.steer_hist = deque([0.0] * maxlen, maxlen=maxlen)
-        self.throttle_pred = deque([0.0] * maxlen, maxlen=maxlen)
-        self.steer_pred = deque([0.0] * maxlen, maxlen=maxlen)
-
-    def update(self, throttle: float, steering: float) -> Tuple[float, float]:
-        """
-        Push new command and return delay-compensated estimate.
-
-        Returns:
-            (compensated_throttle, compensated_steering)
-        """
-        self.throttle_hist.append(throttle)
-        self.steer_hist.append(steering)
-
-        if self.td == 0 or len(self.throttle_hist) <= self.td:
-            self.throttle_pred.append(throttle)
-            self.steer_pred.append(steering)
-            return throttle, steering
-
-        th = list(self.throttle_hist)
-        sh = list(self.steer_hist)
-        tp = list(self.throttle_pred)
-        sp = list(self.steer_pred)
-
-        v_td = th[-self.td - 1]
-        dv_td = (th[-self.td] - v_td) / self.dt
-        vp_td = tp[-self.td - 1]
-        dvp_td = (tp[-self.td] - vp_td) / self.dt
-
-        vp_now = tp[-1] + self.dt * (
-            dv_td + self.k1 * (dv_td - dvp_td) + self.k2 * (v_td - vp_td)
-        )
-        self.throttle_pred.append(vp_now)
-
-        s_td = sh[-self.td - 1]
-        ds_td = (sh[-self.td] - s_td) / self.dt
-        sp_td = sp[-self.td - 1]
-        dsp_td = (sp[-self.td] - sp_td) / self.dt
-
-        sp_now = sp[-1] + self.dt * (
-            ds_td + self.k1 * (ds_td - dsp_td) + self.k2 * (s_td - sp_td)
-        )
-        self.steer_pred.append(sp_now)
-
-        return float(vp_now), float(sp_now)
-
-
-class DisturbanceObserver:
-    """
-    First-order velocity disturbance observer (DOB).
-
-    Estimates the unmodeled longitudinal disturbance force (terrain drag,
-    SCM sinkage resistance, grade, wind) as a lumped acceleration term.
-
-    The observer dynamics are:
-        hdv0 = p0v + a_v * v          (disturbance estimate)
-        dp0v = -a_v * (f_nom + hdv0)  (observer state update)
-
-    where f_nom is the nominal acceleration from the powertrain model.
-
-    The observer is longitudinal only. Extending it to position and heading
-    would correct dead-reckoning drift, which this filter does not accumulate:
-    obstacle positions arrive in the same frame as the measured vehicle pose,
-    so the barrier never integrates a position estimate.
-
-    Args:
-        a_v: Observer bandwidth for velocity (higher = faster tracking,
-             but more noise sensitivity). Default 10.0.
-        max_accel: Maximum powertrain acceleration for nominal model (m/s^2).
-        max_decel: Maximum braking deceleration for nominal model (m/s^2).
-    """
-
-    def __init__(self, a_v: float = 10.0,
-                 max_accel: float = 3.0, max_decel: float = -6.0):
-        self.a_v = a_v
-        self.max_accel = max_accel
-        self.max_decel = max_decel
-        self.p0v = 0.0  # Observer internal state
-        self._initialized = False
-
-    def update(self, v: float, alpha: float, dt: float,
-               f_nom_override: Optional[float] = None) -> float:
-        """
-        Update the DOB and return the velocity disturbance estimate.
-
-        Args:
-            v: Current longitudinal speed (m/s)
-            alpha: Current normalized throttle/brake input [-1, 1]
-                   (positive = throttle, negative = brake)
-            dt: Time step (s)
-            f_nom_override: If provided, use this as the nominal longitudinal
-                acceleration instead of the internal linear model. This allows
-                the NN tire model to supply a physics-based f_nom so the DOB
-                only estimates *true* unmodeled disturbances.
-
-        Returns:
-            hdv0: Estimated longitudinal disturbance acceleration (m/s^2).
-                  Positive = unexplained acceleration, negative = drag/resistance.
-        """
-        # On first call, initialize p0v so that hdv0 = 0 (no initial disturbance)
-        if not self._initialized:
-            self.p0v = -self.a_v * v
-            self._initialized = True
-
-        hdv0 = self.p0v + self.a_v * v
-
-        # Nominal acceleration model
-        if f_nom_override is not None:
-            f_nom = f_nom_override
-        elif alpha >= 0:
-            f_nom = self.max_accel * alpha
-        else:
-            f_nom = self.max_decel * abs(alpha)
-
-        # Observer dynamics: dp0v = -a_v * (f_nom + hdv0)
-        dp0v = -self.a_v * (f_nom + hdv0)
-        self.p0v += dp0v * dt
-
-        return hdv0
-
-    @property
-    def disturbance_estimate(self) -> float:
-        """Current disturbance estimate without updating."""
-        return self.p0v
-
-    def reset(self):
-        self.p0v = 0.0
-        self._initialized = False
+    n = float(terrain["n"])
+    best = 0.0
+    for slip in np.linspace(0.02, 0.5, 30):
+        fy_f = nn.predict_numeric(float(slip), fz_f, 5.0, kappa=0.0,
+                                  n_terrain=n, terrain_params=terrain,
+                                  rates=np.zeros(3))[1]
+        fy_r = nn.predict_numeric(float(slip), fz_r, 5.0, kappa=0.0,
+                                  n_terrain=n, terrain_params=terrain,
+                                  rates=np.zeros(3))[1]
+        if not (np.isfinite(fy_f) and np.isfinite(fy_r)):
+            continue
+        lat = (2.0 * abs(fy_f) + 2.0 * abs(fy_r)) / mass
+        best = max(best, lat)
+    return float(best)
 
 
 class CBFSafetyFilter:
-    """
-    DOB-CBF safety filter with weighted ellipsoidal barrier.
+    """The DOB-CBF of the module docstring, with the plant node's filter interface.
 
-    Filters manual or MPC control inputs to enforce safety constraints:
-    1. Obstacle avoidance via heading-aligned ellipsoidal CBF (prefers steering)
-    2. Terrain-aware speed limits (from roughness + NN traction prediction)
-    3. Disturbance observer for longitudinal force estimation
-    4. Latency compensation (forward prediction of vehicle state)
-
-    The filter solves a QP at each step:
-        min  ||u - u_des||^2_W
-        s.t. -psi1_i @ u <= psi0_i  (CBF constraints per obstacle)
-             actuator limits
-
-    Control inputs: u = [dbeta (steering rate), alpha (throttle)]
-
-    The ellipsoidal barrier uses P = R^T diag(w_long, w_lat) R with
-    w_long << w_lat, so lateral avoidance is cheaper than braking in barrier
-    space. An isotropic barrier admits no such preference and reduces throttle
-    where a steering correction would suffice.
-
-    Args:
-        vehicle_params: Dict with M, Lf, Lr, Izz, h_cg, T
-        nn_casadi: Optional NNCasADi for tire force prediction
-        max_steering_rate: Maximum steering angle rate (rad/s)
-        cbf_alpha: First CBF class-K gain (l1cbf). Higher = more conservative.
-        cbf_alpha2: Second CBF class-K gain (l2cbf).
-        obstacle_buffer: Extra safety margin around obstacles (m)
-        vehicle_radius: Effective geometric vehicle-footprint radius (m)
-        max_speed: Absolute maximum allowed speed (m/s)
-        delay_steps: Actuation delay in control steps for compensator
-        control_dt: Safety filter update period (s)
-        w_long: Barrier weight in longitudinal (heading) direction.
-                Smaller values -> larger "safe zone" ahead -> earlier braking.
-        w_lat: Barrier weight in lateral direction.
-               Larger values -> tighter lateral clearance -> stronger steer signal.
-        forward_bias: Forward shift of barrier center (m). Makes filter more
-                      proactive for obstacles ahead. 0 = no bias.
-        dob_bandwidth: DOB velocity observer bandwidth. Higher = faster.
-        cbf_flavor: 'balance' (equal cost to modify steering/throttle),
-                    'steer_priority' (strongly prefers throttle modification),
-                    'throttle_priority' (strongly preserves throttle).
-        teleop_delay: Estimated one-way network delay for teleoperation (s).
-                      0 = no teleop compensation (local control). When > 0,
-                      the barrier is inflated by v * RTT to account for operator
-                      reaction lag, and stale commands trigger emergency braking.
-        stale_cmd_timeout: Maximum command age before auto-brake (s).
-                           Only active when teleop_delay > 0.
+    ``gamma`` (1/s) is the condition's decay rate, a free design parameter. ``observer_k_dt`` is the observer's
+    gain times the period, the value the identification ran it with.
     """
 
-    # Speed at which the tire surrogate stops being queried at the true state.
-    # The query clamp and the resistance taper that repairs it read this one
-    # value, so the two cannot drift apart.
-    _NN_QUERY_SPEED_FLOOR = 0.5  # m/s
-
-    def __init__(self,
-                 vehicle_params: dict,
-                 nn_casadi=None,
-                 max_steering_rate: float = 8.0,
-                 steer_tau: float = 0.12,
-                 max_alpha_rate: float = 8.0,
-                 cbf_alpha: float = 1.0,
-                 cbf_alpha2: float = 0.8,
-                 obstacle_buffer: float = 0.25,
-                 vehicle_radius: float = 1.0,
-                 max_speed: float = 15.0,
-                 delay_steps: int = 5,
-                 control_dt: float = 0.02,
-                 w_long: float = 0.15,
-                 w_lat: float = 0.50,
-                 forward_bias: float = 1.5,
-                 dob_bandwidth: float = 10.0,
-                 cbf_flavor: str = 'balance',
-                 teleop_delay: float = 0.0,
-                 stale_cmd_timeout: float = 2.0,
-                 variant: str = 'dob_cbf',
-                 braking_barrier: bool = False,
-                 brake_margin: float = 0.85,
-                 gamma_brake: float = 3.0,
-                 sense_range: float = 30.0,
-                 unseen_obstacle_radius: float = 1.0,
-                 front_extent: float = 2.6,
-                 corridor_half_width: float = 1.2,
-                 **_ignored):
-
-        # Filter variant label, recorded in diagnostics so a run's logs
-        # identify which barrier configuration produced them.
-        self.variant = (variant or 'dob_cbf').lower()
-
-        # Vehicle parameters
-        self.M = vehicle_params['M']
-        self.Lf = vehicle_params['Lf']
-        self.Lr = vehicle_params['Lr']
-        self.L = self.Lf + self.Lr
-        self.Izz = vehicle_params['Izz']
-        self.h_cg = vehicle_params.get('h_cg', 0.65)
-        self.T = vehicle_params.get('T', 1.8194)
-
-        # NN tire model for traction-aware limits
-        self.nn_casadi = nn_casadi
-
-        # CBF parameters
-        self.alpha1 = cbf_alpha      # class-K gain on h
-        self.alpha2 = cbf_alpha2     # class-K gain on h_dot
-        self.obstacle_buffer = obstacle_buffer
-        self.vehicle_radius = vehicle_radius
-        self.max_speed = max_speed
-        self.max_steer_rate = max_steering_rate
-        self.steer_tau = max(steer_tau, 1e-3)   # first-order steering-actuator lag (s)
-        self.max_alpha_rate = max_alpha_rate    # throttle/brake (alpha) rate limit (1/s)
-        self.control_dt = control_dt
-
-        # Ellipsoidal barrier weights; w_long < w_lat elongates the safe set
-        # along the heading, making lateral escape the cheaper correction.
-        self.w_long = w_long
-        self.w_lat = w_lat
-        self.forward_bias = forward_bias
-
-        # CBF flavor controls QP cost weighting
-        self.cbf_flavor = cbf_flavor
-
-        # Teleop delay compensation
-        self._teleop_enabled = teleop_delay > 0.0  # Only activate if explicitly set
-        self._teleop_delay = max(teleop_delay, 0.0)
-        self._stale_cmd_timeout = stale_cmd_timeout
-        self._cmd_age = 0.0        # Latest measured command age (s)
-        self._last_cmd_wall = None  # Wall-clock time of last received command
-        self._delay_ema = teleop_delay  # EMA-smoothed one-way delay estimate
-        self._delay_ema_alpha = 0.15    # EMA smoothing factor
-
-        # Obstacle filtering range — must cover the ellipsoidal barrier's
-        # longitudinal reach: reach ~ forward_bias + sqrt(max_safe_r^2 / w_long)
-        max_safe_r = vehicle_radius + obstacle_buffer + 5.0
-        self.r_precpt = forward_bias + np.sqrt(max_safe_r**2 / w_long) + 10.0
-
-        # Delay compensator
-        self.delay_comp = DelayCompensator(
-            delay_steps=delay_steps, dt=control_dt
-        )
-
-        # Disturbance observer
-        self.dob = DisturbanceObserver(
-            a_v=dob_bandwidth,
-            max_accel=3.0,
-            max_decel=-6.0,
-        )
-
-        # Steering angle conversion
-        self.max_road_steer_angle = 0.49  # rad (HMMWV)
-
-        # Actuator limits
-        self.max_accel = 3.0   # m/s^2 throttle
-        self.max_decel = -6.0  # m/s^2 braking
-
-        # Live-terrain conditioning of the filter's own tire queries, and the
-        # measured grip scale from the controller's force-map adapter. Both
-        # are opt-in through update_terrain; when neither is enabled the tire
-        # model is queried at its nominal soil and the authority scaling
-        # follows the linear map of the Bekker exponent alone.
-        self._terrain_n = None
-        self._terrain_params = None
-        self._use_terrain_nn = False
-        self._grip_scale = 1.0
-        self._use_grip_scale = False
-
-        # Braking-distance barrier (opt-in). The ellipse barrier above is a
-        # function of position only, so where it starts braking does not move
-        # with speed or soil. This first-order barrier on the along-track gap,
-        #   h_b = gap - v^2 / (2 a_h),   a_h = brake_margin * a_soil,
-        # is the adaptive-cruise-control form of Ames et al. (2017): its zero
-        # set is the last point from which braking at the soil's deceleration
-        # still stops short, so its onset grows with v^2 / a_soil. a_soil is
-        # the rig surrogate's peak braking deceleration on the believed soil,
-        # the same number MPSF uses. A second row of the same form treats the
-        # edge of the sensing range as an obstacle, which limits speed to what
-        # can be stopped inside the sensed region.
-        self.braking_barrier = bool(braking_barrier)
-        self.brake_margin = float(brake_margin)
-        self.gamma_brake = float(gamma_brake)
+    def __init__(self, vehicle_params: dict, ident: dict, powertrain: str = "shafts", nn=None,
+                 control_dt: float = 0.1, gamma: float = 3.0, observer_k_dt: float = 0.5,
+                 sense_range: float = 30.0, odd_obstacle_radius: float = 1.0, stale_cmd_timeout: float = 2.0,
+                 teleop_delay: float = 0.0, traffic_speed_err: float = 0.0, unknown_downgrade: float = 0.15,
+                 nn_model_dir: str = "nn_models/tire_force_static", nominal_soil: str = "sand"):
+        self.variant = "dob_cbf"
+        self.vehicle_params = dict(vehicle_params)
+        self.dt = float(control_dt)
+        self.gamma = float(gamma)
+        self.k_obs = float(observer_k_dt) / self.dt
         self.sense_range = float(sense_range) if sense_range else 0.0
-        self.unseen_obstacle_radius = float(unseen_obstacle_radius)
-        self.front_extent = float(front_extent)
-        self.corridor_half_width = float(corridor_half_width)
-        self._a_soil = 6.0          # soil-blind default, the nominal max_decel
-        self._a_soil_source = "default"
-        self._brake_rows_binding = 0
-        self._last_brake_ub = float('inf')
-        from .authority import static_axle_loads
-        self._fz_f_static, self._fz_r_static, self._mass_static = static_axle_loads()
-
-        # Clock for command ages, staleness and the steering lag. Wall time by
-        # default (the published behaviour). set_clock() swaps in simulation
-        # time, which makes the filter independent of machine load.
+        self.odd_radius = float(odd_obstacle_radius)
+        self.traffic_speed_err = float(traffic_speed_err)
+        self.unknown_downgrade = float(unknown_downgrade)
+        if ident.get("footprint") != "box":
+            raise ValueError("these bounds were identified for another footprint (need the body rectangle)")
+        b = ident["powertrains"][powertrain]
+        self.s0, self.s1 = b["stop"]["s0"], b["stop"]["s1"]
+        self.l0, self.l1 = b["lateral"]["l0"], b["lateral"]["l1"]
+        self.sigma = b["observer"]["sigma"]
+        self.e0 = b["observer"]["e0"]
+        self.x_rear, self.x_front, self.half_width = fp.body_box()
+        self.max_steer = spec.MAX_ROAD_WHEEL
+        self.w_max = float(np.tan(self.max_steer))
+        self.steer_step = spec.STEER_RATE * self.max_steer * self.dt
+        self.pedal_step = spec.PEDAL_RATE * self.dt
+        self._teleop_delay = max(float(teleop_delay), 0.0)
+        self._stale_cmd_timeout = float(stale_cmd_timeout)
         self._clock = time.time
+        self._last_cmd_wall = None
 
-        # Current steering angle state (integrated from dbeta)
-        self._beta = 0.0  # road wheel angle (rad)
-        self._alpha = 0.0  # last throttle command
+        _dir = Path(str(nn_model_dir)).expanduser()
+        if not _dir.is_absolute():
+            _dir = Path(__file__).resolve().parents[2] / _dir
+        nominal = nominal_terrain(nominal_soil)
+        self._nn = nn if nn is not None else nn_loader()(str(_dir), nominal)
+        self._bike = SurrogateBicycle(self._nn, self.vehicle_params, powertrain)
+        self.L = self._bike.L
+        self._soil = f"nominal:{nominal_soil}"
+        self._set_soil(nominal)
 
-        # Steering-output actuator model. A large call-to-call jump in the
-        # commanded road-wheel angle -- the QP switching between two far-apart
-        # avoidance solutions -- would impulse the steering rack and front
-        # suspension, which no physical rack can execute. The output is
-        # therefore rate-limited to the rack's slew rate and passed through a
-        # first-order lag, so the filter only ever commands motion the actuator
-        # can produce.
-        self._last_safe_steering = 0.0   # last (slewed) normalized steering out
-        self._reactive_dir = 0.0         # committed reactive-steer side (hysteresis)
-        self._last_filter_wall = None    # clock time of previous filter() call
-        self._steer_track_ema = 0.0      # EMA of |measured - commanded| road angle
-        self._steer_broken = False       # latched once a break is detected
-
-        # Rear-approach avoidance: when a vehicle closes from behind, never let
-        # the driver slow down (braking raises rear-end risk), and accelerate to
-        # try to escape when the path ahead is clear -- including from a standstill.
-        self._rear_threat_dist = 12.0    # m: a closing rear obstacle within this is a threat
-        self._rear_half_w = 2.5          # m: lateral half-width counted as "same lane"
-        self._prev_rear_dist = float('inf')
-
-        # State for logging
-        self._last_result = None
+        self._delta = 0.0          # applied road-wheel angle, tracked through the rate limit
+        self._pedal = 0.0          # applied pedal
+        self._xi = None            # observer state
+        self._d_hat = 0.0
+        self._a_mean = 0.0         # the model's mean du/dt over the last period
+        self._t_obs = 0.0
         self._filter_count = 0
         self._modify_count = 0
+        self._infeasible_count = 0
+        self._stale_brake_count = 0
+        self._solve_ms_ema = 0.0
+        self._last_result = None
+        self._last_min_h = float("inf")
+        self._last_margin = 0.0
+        self._last_stop = 0.0
 
-        # CSV logging for diagnostics
-        self._csv_file = None
-        self._csv_writer = None
-        self._obs_csv_file = None
-        self._obs_csv_writer = None
-        self._init_csv_logging()
-
-        # Cache for NN tire force queries (avoid redundant calls per step)
-        self._nn_cache = {}
-
-    # ------------------------------------------------------------------
-    # Teleop delay API
-    # ------------------------------------------------------------------
-
+    # -- the plant node's interface ------------------------------------------------------------------
     def set_clock(self, clock):
-        """Use ``clock()`` (seconds) instead of wall time.
-
-        It drives the command-age smoother, the stale-command brake and the
-        steering lag. With wall time all three depend on how fast the machine
-        runs the simulation, which made repeated runs differ.
-        """
+        """Use ``clock()`` (seconds) for command ages. The plant node passes simulation time."""
         self._clock = clock
 
     def set_teleop_delay(self, delay_s: float):
-        """Set estimated one-way teleop network delay (seconds)."""
-        self._teleop_delay = max(delay_s, 0.0)
-        self._delay_ema = max(delay_s, 0.0)
-        self._teleop_enabled = self._teleop_delay > 0.0
+        """The link's one-way delay. Above zero, commands come over a link, and a stale one brakes."""
+        self._teleop_delay = max(float(delay_s), 0.0)
 
-    def update_terrain(self, terrain_params, phi_uncertainty_deg=None,
-                       n_sigma=None, hedge_k=None,
-                       use_terrain_nn=None, grip_scale=None,
-                       use_grip_scale=None):
-        """Re-condition the filter on the live online terrain estimate.
-
-        The filter's longitudinal authority is grip-limited, and grip drops on
-        softer soil, so the available accel/brake (which set the CBF's
-        deceleration budget and effective stopping buffer) are scaled by the
-        firmness of the live soil. A lower Bekker exponent n means softer soil
-        and yields a more conservative filter. The plant node calls this only
-        while the online terrain estimator is running; otherwise the nominal
-        limits stand.
-
-        Belief-robust authority: when the estimator's posterior std ``n_sigma``
-        and a risk factor ``hedge_k`` are supplied, the authority is evaluated
-        at the pessimistic quantile ``n - hedge_k * n_sigma`` -- the filter
-        trusts its brakes only as much as the *worst plausible* soil allows,
-        so an uncertain estimate widens the stopping buffer instead of
-        silently assuming the mean.
-        """
-        try:
-            n = float(terrain_params["n"] if isinstance(terrain_params, dict)
-                      else terrain_params)
-        except (TypeError, ValueError, KeyError):
-            return
-        self._terrain_n = n
-        if isinstance(terrain_params, dict):
-            self._terrain_params = dict(terrain_params)
-        if use_terrain_nn is not None:
-            self._use_terrain_nn = bool(use_terrain_nn)
-        if use_grip_scale is not None:
-            self._use_grip_scale = bool(use_grip_scale)
-        if grip_scale is not None:
-            self._grip_scale = float(np.clip(grip_scale, 0.4, 1.2))
-        n_eff = n
-        if n_sigma is not None and hedge_k is not None and float(hedge_k) > 0.0:
-            n_eff = float(np.clip(n - float(hedge_k) * float(n_sigma), 0.4, 1.3))
-        self._terrain_n_eff = n_eff
-        # n in [~0.4 soft, ~1.3 firm] -> grip scale in [0.6, 1.0]
-        grip = float(np.clip(0.6 + 0.4 * (n_eff - 0.4) / 0.9, 0.5, 1.0))
-        # Measured grip scale from the controller's force-map adapter: the
-        # ratio of realised to modelled lateral force. On soils with less
-        # grip than their n implies (off-manifold friction/cohesion), the
-        # n-map above cannot see the deficit; s can.
-        if self._use_grip_scale:
-            grip *= self._grip_scale
-        self.max_accel = 3.0 * grip
-        self.max_decel = -6.0 * grip
-        if self.braking_barrier:
-            self._update_soil_braking(terrain_params, n_eff)
-
-    def _update_soil_braking(self, terrain_params, n_eff):
-        """Peak braking deceleration on the believed soil, from the surrogate.
-
-        Evaluated at the hedged exponent when a hedge is in force. Without a
-        surrogate or a full soil description, the soil-blind default stays.
-        """
-        if self.nn_casadi is None or not isinstance(terrain_params, dict):
-            return
-        required = ("Kphi", "Kc", "c", "phi", "k", "n")
-        if any(terrain_params.get(key) is None for key in required):
-            return
-        terrain = dict(terrain_params)
-        terrain["n"] = float(n_eff)
-        try:
-            from .authority import peak_braking_decel
-            a = peak_braking_decel(self.nn_casadi, terrain, self._fz_f_static,
-                                   self._fz_r_static, self._mass_static)
-        except Exception as e:  # noqa: BLE001
-            print(f"  [CBF] braking authority query failed ({type(e).__name__}: {e}); "
-                  f"keeping a_soil={self._a_soil:.2f}")
-            return
-        if a > 0.0:
-            self._a_soil = float(np.clip(a, 0.5, 9.81))
-            self._a_soil_source = "surrogate"
-
-    def update_command_age(self, cmd_wall_time: float):
-        """
-        Update teleop delay estimate from a received command's wall-clock stamp.
-
-        Call this each time a ControlCommand arrives.  Computes one-way
-        latency as ``time.time() - cmd_wall_time`` and feeds an EMA filter.
-        Also tracks the wall-clock of the most recent command for staleness.
-
-        Args:
-            cmd_wall_time: The ``wall_time`` field from the ControlCommand.
-        """
-        now = self._clock()
-        one_way = max(now - cmd_wall_time, 0.0)
-        self._cmd_age = one_way
-        self._last_cmd_wall = now  # arrival time of the most recent command
-        # The delay estimate is updated only when teleoperation was enabled at
-        # construction (delay > 0). Loopback transport latency of one or two
-        # milliseconds must not engage the teleop prediction or the
-        # stale-command brake.
-        if self._teleop_enabled:
-            a = self._delay_ema_alpha
-            self._delay_ema = a * one_way + (1.0 - a) * self._delay_ema
-            self._teleop_delay = self._delay_ema
-
-    def _effective_obstacle_buffer(self, v: float) -> float:
-        """
-        Compute obstacle buffer inflated by teleop round-trip delay.
-
-        At speed *v* with one-way delay *tau*, the vehicle travels
-        ``v * 2 * tau`` metres during the round trip before the operator can
-        react. That distance, scaled by 0.5, is added to the static
-        obstacle_buffer.
-
-        Returns the effective buffer in metres.
-        """
-        if self._teleop_delay <= 0.0:
-            return self.obstacle_buffer
-        rtt = 2.0 * self._teleop_delay
-        return self.obstacle_buffer + v * rtt * 0.5
+    def update_command_age(self):
+        """A command has arrived."""
+        self._last_cmd_wall = self._clock()
 
     def _is_command_stale(self) -> bool:
-        """True if no command received within stale_cmd_timeout (teleop only)."""
         if self._teleop_delay <= 0.0 or self._last_cmd_wall is None:
             return False
-        age = self._clock() - self._last_cmd_wall
-        return age > self._stale_cmd_timeout
+        return (self._clock() - self._last_cmd_wall) > self._stale_cmd_timeout
 
-    def _init_csv_logging(self):
-        """Initialize CSV files for safety filter diagnostics."""
-        import csv
-        import os
-        # Parallel sweeps set HIL_RUN_LOG_DIR to a unique per-run directory
-        # (see benchmarking/common.py) so concurrent workers never share a log
-        # file. Live and operator-driven runs leave it unset and write to the
-        # repository-level logs/ directory.
-        log_dir = os.environ.get('HIL_RUN_LOG_DIR') or os.path.join(
-            os.path.dirname(__file__), '..', 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-
-        # Main filter log: one row per filter() call
-        main_path = os.path.join(log_dir, 'cbf_filter_log.csv')
-        self._csv_file = open(main_path, 'w', newline='')
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow([
-            'step', 'x', 'y', 'psi_deg', 'v', 'beta_deg', 'hdv0',
-            'n_obs', 'n_constraints', 'min_h',
-            'steer_in', 'throttle_in', 'brake_in',
-            'steer_out', 'throttle_out', 'brake_out',
-            'alpha_cmd', 'alpha_out',
-            'was_modified', 'active_constraints', 'solve_ms',
-            'qp_success', 'v_max_terrain',
-        ])
-
-        # Per-obstacle log: one row per obstacle per filter() call
-        obs_path = os.path.join(log_dir, 'cbf_obstacle_log.csv')
-        self._obs_csv_file = open(obs_path, 'w', newline='')
-        self._obs_csv_writer = csv.writer(self._obs_csv_file)
-        self._obs_csv_writer.writerow([
-            'step', 'obs_x', 'obs_y', 'obs_r', 'dist',
-            'd_along', 'd_cross', 'd_along_unbiased',
-            'h', 'h_dot', 'h_ddot_auto',
-            'A_steer', 'A_alpha', 'psi0',
-            'psi1_steer', 'psi1_alpha',
-            'skipped_hdot', 'skipped_far',
-        ])
-        print(f"  [CBF] CSV logging to {log_dir}/cbf_*.csv")
-
-    def _log_csv_obstacle(self, step, obs_x, obs_y, obs_r, dist,
-                          d_along, d_cross, d_along_unbiased,
-                          h, h_dot, h_ddot_auto,
-                          A_steer, A_alpha, psi0, psi1_steer, psi1_alpha,
-                          skipped_hdot, skipped_far):
-        if self._obs_csv_writer:
-            self._obs_csv_writer.writerow([
-                step, f'{obs_x:.3f}', f'{obs_y:.3f}', f'{obs_r:.3f}', f'{dist:.2f}',
-                f'{d_along:.3f}', f'{d_cross:.3f}', f'{d_along_unbiased:.3f}',
-                f'{h:.4f}', f'{h_dot:.4f}', f'{h_ddot_auto:.4f}',
-                f'{A_steer:.6f}', f'{A_alpha:.6f}', f'{psi0:.4f}',
-                f'{psi1_steer:.6f}', f'{psi1_alpha:.6f}',
-                int(skipped_hdot), int(skipped_far),
-            ])
-
-    def _log_csv_main(self, step, x, y, psi, v, beta, hdv0,
-                      n_obs, n_constraints, min_h,
-                      steer_in, throttle_in, brake_in,
-                      steer_out, throttle_out, brake_out,
-                      alpha_cmd, alpha_out,
-                      was_modified, active_constraints, solve_ms,
-                      qp_success, v_max_terrain):
-        if self._csv_writer:
-            self._csv_writer.writerow([
-                step, f'{x:.3f}', f'{y:.3f}', f'{np.degrees(psi):.2f}',
-                f'{v:.3f}', f'{np.degrees(beta):.2f}', f'{hdv0:.4f}',
-                n_obs, n_constraints, f'{min_h:.4f}',
-                f'{steer_in:.4f}', f'{throttle_in:.4f}', f'{brake_in:.4f}',
-                f'{steer_out:.4f}', f'{throttle_out:.4f}', f'{brake_out:.4f}',
-                f'{alpha_cmd:.4f}', f'{alpha_out:.4f}',
-                int(was_modified), active_constraints, f'{solve_ms:.2f}',
-                int(qp_success), f'{v_max_terrain:.2f}',
-            ])
-            # Flush periodically so the log is readable mid-run.
-            if step % 100 == 0:
-                self._csv_file.flush()
-                self._obs_csv_file.flush()
-
-    def _resistive_acceleration(self, nn_forces, u_measured: float) -> float:
-        """Control-independent longitudinal resistance at the current state.
-
-        The tire surrogate is queried at ``max(u, _NN_QUERY_SPEED_FLOOR)`` to
-        keep the slip-angle arctangents well-conditioned, so below that speed
-        it reports the resistance of a vehicle rolling at the clamp rather than
-        of the one in front of it. At rest that resistance is not acting: the
-        tires are held by static friction. Feeding it to the observer would
-        make the difference against a measured zero acceleration read as an
-        unexplained forward disturbance, which the barrier charges to h_ddot
-        and answers with brake -- sustaining the standstill that produced it.
-        Scaling by the speed ratio restores the physical limit at ``u = 0`` and
-        is exactly unity at and above the clamp, where the surrogate is
-        evaluated at the true state.
-        """
-        if nn_forces is None:
-            return 0.0
-        taper = min(1.0, abs(float(u_measured)) / self._NN_QUERY_SPEED_FLOOR)
-        # Resistance opposes the motion; the surrogate reports it for forward
-        # rolling. Rolling backward, the same magnitude acts forward.
-        direction = 1.0 if float(u_measured) >= 0.0 else -1.0
-        return float(nn_forces['ax_nn']) * taper * direction
-
-    # Representative drive slip ratio at which the surrogate is asked what
-    # longitudinal force the soil will actually deliver.
-    _AUTHORITY_SLIP_RATIO = 0.15
-
-    # Braking cap used in the observer's nominal when the executed command is
-    # a brake. It must upper-bound any deceleration the plant can produce, so
-    # it is 1 g -- no tire-soil pairing here brakes harder -- and deliberately
-    # NOT the grip-scaled ``max_decel``, whose model reaches 7.2 m/s^2 under a
-    # high grip-scale and whose heuristic can undershoot realized braking on
-    # firm ground. An undershoot here flips the bias into crediting the
-    # barrier with deceleration that stops when the brakes are released;
-    # overestimating is the safe direction, booked by the observer as a
-    # phantom *forward* disturbance that tightens the barrier.
-    _BRAKE_NOMINAL_ENVELOPE = 9.81  # m/s^2
-
-    def _longitudinal_authority(self, u: float, v_lat: float, omega: float,
-                                delta: float, baseline) -> float:
-        """Acceleration one unit of alpha buys on the soil underneath.
-
-        This is the coefficient the barrier places on its decision variable,
-        so it is a function of state alone: deriving it from the driver's
-        pedal would make the safe set change shape with the command, and the
-        asymmetric drive/brake envelopes would make it discontinuous across a
-        touch of the brake. The drive-slip secant deliberately *under*-credits
-        braking -- the QP then brakes harder than strictly needed when it
-        intervenes, which is the conservative direction. ``baseline`` is the
-        zero-slip query already made this step; when it failed there is no
-        difference to take, and the actuator envelope is the fallback rather
-        than a lone slipped query masquerading as one.
-        """
-        if self.nn_casadi is None or baseline is None:
-            return self.max_accel
-        slipped = self._compute_nn_tire_forces(
-            u, v_lat, omega, delta, kappa=self._AUTHORITY_SLIP_RATIO)
-        if slipped is None:
-            return self.max_accel
-        delta_ax = float(slipped['ax_nn']) - float(baseline['ax_nn'])
-        return float(np.clip(abs(delta_ax), 0.3, self.max_accel))
-
-    def _compute_nn_tire_forces(self, u: float, v_lat: float, omega: float,
-                                 delta: float, kappa: float = 0.0
-                                 ) -> Optional[Dict[str, float]]:
-        """
-        Query NN tire model for front/rear Fx, Fy and derived quantities.
-
-        Uses bicycle-model slip angles to query the NN at front and rear axles.
-        Returns None if nn_casadi is not available.
-
-        Returns dict with:
-            Fx_total: Total longitudinal force (N), both axles, both sides
-            Fy_total: Total lateral force (N), both axles, both sides
-            Mz_yaw:   Yaw moment from lateral forces (N·m)
-            ax_nn:     Longitudinal acceleration (m/s²)
-            ay_nn:     Lateral acceleration (m/s²)
-            alpha_dot: Yaw angular acceleration (rad/s²)
-            Fy_f:      Front axle lateral force per wheel (N)
-            Fy_r:      Rear axle lateral force per wheel (N)
-            alpha_f:   Front slip angle (rad)
-            alpha_r:   Rear slip angle (rad)
-        """
-        if self.nn_casadi is None:
-            return None
-
-        g = 9.81
-        u_safe = max(u, self._NN_QUERY_SPEED_FLOOR)  # Avoid division by zero
-
-        # Bicycle model slip angles
-        alpha_f = delta - np.arctan2(v_lat + self.Lf * omega, u_safe)
-        alpha_r = -np.arctan2(v_lat - self.Lr * omega, u_safe)
-
-        # Clamp slip angles to training-data range
-        _alpha_max = 0.55
-        alpha_f = float(max(-_alpha_max, min(_alpha_max, alpha_f)))
-        alpha_r = float(max(-_alpha_max, min(_alpha_max, alpha_r)))
-
-        # Normal forces (static weight distribution, per wheel)
-        Fz_f = self.M * g * self.Lr / self.L / 2.0
-        Fz_r = self.M * g * self.Lf / self.L / 2.0
-
+    def update_terrain(self, terrain_params):
+        """The soil belief, in the surrogate's internal convention."""
+        if not isinstance(terrain_params, dict):
+            return
+        terrain = dict(terrain_params)
         try:
-            _tkw = {}
-            if self._use_terrain_nn and self._terrain_n is not None:
-                _tkw = dict(n_terrain=self._terrain_n,
-                            terrain_params=self._terrain_params)
-            Fx_f, Fy_f = self.nn_casadi.predict_numeric(alpha_f, Fz_f, u_safe, kappa, **_tkw)
-            Fx_r, Fy_r = self.nn_casadi.predict_numeric(alpha_r, Fz_r, u_safe, kappa, **_tkw)
-            if self._use_grip_scale:
-                # Measured-over-modelled force ratio from the adapter: the
-                # filter's predicted control authority shrinks with it.
-                Fx_f *= self._grip_scale; Fy_f *= self._grip_scale
-                Fx_r *= self._grip_scale; Fy_r *= self._grip_scale
+            self._set_soil(terrain)
+            self._soil = f"belief:n={float(terrain['n']):.2f},phi={float(terrain['phi']):.1f}"
+        except Exception as e:  # noqa: BLE001
+            print(f"  [DOB-CBF] soil update failed ({type(e).__name__}: {e})")
 
-            # Total forces (×2 for left+right wheels)
-            Fx_total = 2.0 * (Fx_f + Fx_r)
-            Fy_total = 2.0 * (Fy_f + Fy_r)
-            # Yaw moment: front pushes one way, rear the other
-            Mz_yaw = 2.0 * (self.Lf * Fy_f - self.Lr * Fy_r)
+    def _set_soil(self, terrain):
+        b = self._bike
+        b.set_terrain(terrain)
+        self._a_lat = peak_lateral_accel(self._nn, terrain, b.fz_f, b.fz_r, b.M)
+        self._traffic_decel = b.peak_decel()
+        self._traffic_accel = b.drive_capability()
 
-            return {
-                'Fx_total': Fx_total,
-                'Fy_total': Fy_total,
-                'Mz_yaw': Mz_yaw,
-                'ax_nn': Fx_total / self.M,
-                'ay_nn': Fy_total / self.M,
-                'alpha_dot': Mz_yaw / self.Izz,
-                'Fy_f': Fy_f,
-                'Fy_r': Fy_r,
-                'alpha_f': alpha_f,
-                'alpha_r': alpha_r,
-            }
-        except Exception:
-            return None
+    # -- the backup -------------------------------------------------------------------------------
+    def _rate(self, p, v, g_along):
+        a = self._bike.longitudinal(p, v)[0] + g_along
+        return np.where(a < 0.0, a * np.tanh(np.maximum(v, 0.0) / BRAKE_FADE_SPEED), a)
 
-    def _compute_nn_steering_sensitivity(self, u: float, v_lat: float,
-                                          omega: float, delta: float
-                                          ) -> Optional[Tuple[float, float]]:
-        """
-        Estimate dFy/ddelta and dMz/ddelta via finite difference on the NN.
+    def _stop(self, v, p, g_along):
+        """Model stopping distance and time of the backup from arrays of (v, p)."""
+        v = np.array(v, dtype=float)
+        p = np.array(p, dtype=float)
+        dist = np.zeros_like(v)
+        t_stop = np.zeros_like(v)
+        h = 0.02
+        for _ in range(int(60.0 / h)):
+            # Moving, or still on the throttle, which can start a standing vehicle before the brake ramps in.
+            active = (v > 0.05) | (p > 0.0)
+            if not active.any():
+                break
+            p = np.maximum(p - spec.PEDAL_RATE * h, -1.0)
+            v_new = np.maximum(v + h * self._rate(p, v, g_along), 0.0)
+            dist += np.where(active, 0.5 * (v + v_new) * h, 0.0)
+            t_stop += np.where(active, h, 0.0)
+            v = np.where(active, v_new, v)
+        return dist, t_stop
 
-        Returns (dFy_ddelta, dMz_ddelta) or None if NN unavailable.
-        These give the barrier the lateral force and yaw moment produced per
-        unit of steering, which is the filter's steering control authority.
-        """
-        if self.nn_casadi is None:
-            return None
-
-        eps = 0.005  # ~0.3 deg perturbation
-        forces_plus = self._compute_nn_tire_forces(u, v_lat, omega, delta + eps)
-        forces_minus = self._compute_nn_tire_forces(u, v_lat, omega, delta - eps)
-
-        if forces_plus is None or forces_minus is None:
-            return None
-
-        dFy_ddelta = (forces_plus['Fy_total'] - forces_minus['Fy_total']) / (2 * eps)
-        dMz_ddelta = (forces_plus['Mz_yaw'] - forces_minus['Mz_yaw']) / (2 * eps)
-
-        return dFy_ddelta, dMz_ddelta
-
-    def _compute_reactive_steering(self, vehicle_state: dict,
-                                    obstacles: List[Tuple[float, float, float]]) -> float:
-        """
-        Compute a reactive steering avoidance command for nearby obstacles.
-
-        The second-order CBF cannot steer away from head-on obstacles because
-        the barrier gradient is orthogonal to the steering effect (geometric
-        singularity). This layer handles steering directly: for each nearby
-        obstacle ahead, it contributes a steering command away from it,
-        proportional to proximity.
-
-        Returns:
-            Steering adjustment in [-1, 1] (normalized).
-        """
-        x = vehicle_state.get('x', 0.0)
-        y = vehicle_state.get('y', 0.0)
-        psi = vehicle_state.get('psi', 0.0)
-        v = vehicle_state.get('u', 0.0)
-
-        cos_psi = np.cos(psi)
-        sin_psi = np.sin(psi)
-
-        # Act on the single nearest obstacle that is both close and on a
-        # collision course. Summing an avoidance push over every nearby
-        # obstacle would, in a dense field, produce a large standing bias that
-        # fights the driver's own weaving; restricting the layer to an imminent
-        # collision leaves ordinary driving -- steering around obstacles well
-        # before they threaten -- entirely to the driver.
-        nearest = None
-        for (obs_x, obs_y, obs_r) in obstacles:
-            dx_world = obs_x - x
-            dy_world = obs_y - y
-            dx_body = dx_world * cos_psi + dy_world * sin_psi   # forward
-            dy_body = -dx_world * sin_psi + dy_world * cos_psi  # left-positive
-            if dx_body < 1.0:
-                continue
-            safe_r = obs_r + self.vehicle_radius + self.obstacle_buffer
-            # Only obstacles we'd actually hit on the current heading.
-            if abs(dy_body) > safe_r:
-                continue
-            dist = np.sqrt(dx_body**2 + dy_body**2)
-            # Engagement range of roughly two vehicle lengths, growing with
-            # speed: wide enough to act in time, narrow enough that the layer
-            # stays silent across the rest of the field.
-            react_range = safe_r + 3.0 + v * 0.4
-            if dist > react_range:
-                continue
-            if nearest is None or dist < nearest[0]:
-                nearest = (dist, dy_body, safe_r, react_range)
-
-        if nearest is None:
+    def _gravity(self, vehicle_state, v, p):
+        """Gravity along the heading assumed over the backup: the steepest previewed downgrade within its stop
+        (fixed point over the stop length), none without a preview, the steepest admissible downgrade unseen."""
+        prof = downgrades(vehicle_state, self.L, self.unknown_downgrade)
+        if prof is None:
             return 0.0
-        dist, dy_body, safe_r, react_range = nearest
-        proximity = np.clip(1.0 - (dist - safe_r) / max(react_range - safe_r, 0.1), 0.0, 1.0)
-        # Steer away from the obstacle (dy_body > 0 places it to the left, so
-        # the correction is to the right, i.e. negative). The side decision is
-        # hysteretic: once committed, the side is held until the obstacle lies
-        # clearly (> 0.8 m) on the other side, so a near-dead-ahead obstacle
-        # cannot make the correction alternate between the two escape routes.
-        if dy_body > 0.8:
-            self._reactive_dir = -1.0
-        elif dy_body < -0.8:
-            self._reactive_dir = 1.0
-        elif self._reactive_dir == 0.0:
-            self._reactive_dir = -1.0   # first commit: default to the right
-        return float(np.clip(self._reactive_dir * proximity * 0.4, -1.0, 1.0))
+        ds, down = prof
+        if ds is None:
+            return G * float(down)
+        g = 0.0
+        for _ in range(4):
+            s_m, _ = self._stop([v], [p], g)
+            stop = self.s0 + self.s1 * float(s_m[0]) + self.x_front
+            n = min(len(down), int(np.ceil(stop / ds)) + 1)
+            g = G * float(np.max(down[:n]))
+        return g
 
-    def filter(self,
-               desired_steering: float,
-               desired_throttle: float,
-               desired_brake: float,
-               vehicle_state: dict,
-               obstacles: List[Tuple[float, float, float]] = None,
-               terrain_roughness: float = 0.0) -> SafetyFilterResult:
-        """
-        Apply DOB-CBF safety filter to desired control inputs.
+    # -- barriers ---------------------------------------------------------------------------------
+    def _h(self, X, Y, psi, s_m, t_stop, obs, dt_obs=0.0):
+        """Barrier values for every obstacle (before the sampled-data margin), arrays over states."""
+        s_b = self.s0 + self.s1 * s_m
+        lat = self.l0 + self.l1 * s_m
+        front = self.x_front + s_b
+        width = self.half_width + lat
+        out = []
+        t_xr, t_xf, t_w = fp.traffic_box()
+        for ox, oy, orad, vox, voy, hx, hy, speed, vehicle in obs:
+            ox, oy = ox + vox * dt_obs, oy + voy * dt_obs
+            if vehicle:
+                reach = (max(speed, 0.0) + self.traffic_speed_err) * t_stop + 0.5 * self._traffic_accel * t_stop ** 2
+                cs = fp.rect_corners(ox, oy, hx, hy, t_xr, t_xf + reach, t_w)
+                qx, qy = fp.to_body(cs[..., 0], cs[..., 1], X, Y, psi)
+                out.append(fp.box_quad(qx, qy, self.x_rear, front, width))
+            else:
+                ax, ay = fp.to_body(ox, oy, X, Y, psi)
+                out.append(fp.point_box(ax, ay, self.x_rear, front, width) - orad)
+        if self.sense_range > 0.0:
+            out.append(self.sense_range - (self.odd_radius + np.hypot(front, width)))
+        return np.array(out)
 
-        Args:
-            desired_steering: Desired steering input [-1, 1] (normalized)
-            desired_throttle: Desired throttle input [0, 1]
-            desired_brake: Desired brake input [0, 1]
-            vehicle_state: Dict with keys:
-                'x', 'y': world position (m)
-                'psi': heading angle (rad)
-                'u': longitudinal velocity (m/s)
-                'v': lateral velocity (m/s)
-                'omega': yaw rate (rad/s)
-                'delta': current steering angle (rad)
-            obstacles: List of (x, y, radius) tuples
-            terrain_roughness: Terrain roughness metric (m)
-
-        Returns:
-            SafetyFilterResult with filtered inputs and diagnostics.
-        """
-        t_start = time.time()
-        self._filter_count += 1
-
-        if obstacles is None:
-            obstacles = []
-
-        # Normalize obstacles to (x, y, r) plus a parallel is-vehicle flag.
-        # Callers may pass a 4th element (True for a moving vehicle); when it
-        # is absent the flag is inferred from the radius, since rocks are small
-        # (below ~0.7 m) and an HMMWV bounds at ~2.2 m. The flag lets the QP
-        # prefer steering around a static rock while weighting braking equally
-        # for a vehicle, where stopping is an equally valid response.
-        _obs_in = obstacles
-        obstacles = []
-        obs_is_vehicle = []
-        for _o in _obs_in:
-            obstacles.append((_o[0], _o[1], _o[2]))
-            obs_is_vehicle.append(bool(_o[3]) if len(_o) >= 4 else (_o[2] >= 1.5))
-
-        # Extract vehicle state
-        x = vehicle_state.get('x', 0.0)
-        y = vehicle_state.get('y', 0.0)
-        psi = vehicle_state.get('psi', 0.0)
-        v_meas = float(vehicle_state.get('u', 0.5))  # true speed, unclamped
-        v = max(v_meas, 0.1)  # Avoid /0
-        v_lat = vehicle_state.get('v', 0.0)
-        omega = vehicle_state.get('omega', 0.0)
-        delta = vehicle_state.get('delta', 0.0)
-
-        # Update internal beta from measured steering angle
-        self._beta = delta
-
-        # Detection of a broken steering rack belongs to the plant node, which
-        # can read the measured front road-wheel angle. Here `delta` is the
-        # commanded angle, which carries no information about whether the
-        # actuator followed it.
-
-        # Teleop: stale command detection — emergency brake if no recent cmds
-        if self._is_command_stale():
+    # -- filter -------------------------------------------------------------------------------------
+    def _result(self, delta_cmd, pedal, modified, n_rows, t0, min_h):
+        steer = float(np.clip(delta_cmd / self.max_steer, -1.0, 1.0))
+        pedal = float(np.clip(pedal, -1.0, 1.0))
+        self._delta += float(np.clip(steer * self.max_steer - self._delta, -self.steer_step, self.steer_step))
+        self._pedal += float(np.clip(pedal - self._pedal, -self.pedal_step, self.pedal_step))
+        if modified:
             self._modify_count += 1
-            safe_result = SafetyFilterResult(
-                steering=desired_steering,  # hold last steering
-                throttle=0.0,
-                braking=1.0,
-                was_modified=True,
-                active_constraints=0,
-                solve_time_ms=0.0,
-                v_max_terrain=0.0,
-                safety_margin=0.0,
-                dob_norm=0.0,
-            )
-            self._last_result = safe_result
-            if self._filter_count % 20 == 0:
-                age = self._clock() - self._last_cmd_wall if self._last_cmd_wall else float('inf')
-                print(f"  [CBF #{self._filter_count}] STALE COMMAND — age={age:.2f}s > "
-                      f"timeout={self._stale_cmd_timeout:.1f}s  ** EMERGENCY BRAKE **")
-            return safe_result
-
-        # Teleop: compute delay-inflated obstacle buffer for this step
-        effective_buffer = self._effective_obstacle_buffer(v)
-
-        # Apply delay compensation
-        comp_throttle, comp_steering = self.delay_comp.update(
-            desired_throttle, desired_steering
-        )
-
-        # Compute net throttle command for DOB: alpha in [-1, 1]
-        if desired_brake > 0.05:
-            alpha_cmd = -desired_brake
-        else:
-            alpha_cmd = desired_throttle
-
-        # Query NN tire model for current state (used by DOB + CBF)
-        nn_forces = self._compute_nn_tire_forces(v, v_lat, omega, delta)
-        nn_steer_sens = self._compute_nn_steering_sensitivity(v, v_lat, omega, delta)
-
-        # ---- Longitudinal model: a_x(alpha) = f_drag + g_thrust*alpha + hdv0 ----
-        # The barrier's autonomous term must never claim deceleration the
-        # vehicle would not sustain with the pedals released. Two choices make
-        # that a provable inequality for an obstacle ahead rather than a
-        # calibration hope.
-        #
-        # First, the nominal is evaluated at the alpha the plant actually
-        # EXECUTED (last step's filtered output), not the driver's desired
-        # command. During an intervention the two differ by up to the full
-        # pedal range, and a nominal at the desired command books the gap --
-        # measured at up to 8 m/s^2 -- as free deceleration, deactivating the
-        # constraint the filter is in the middle of enforcing and releasing
-        # the driver's throttle back toward the obstacle in a release/re-brake
-        # limit cycle.
-        #
-        # Second, the coefficient is one-sided. Under executed braking the
-        # 1 g bound upper-bounds any deceleration this vehicle can produce on
-        # any soil, so the residual can only bias toward a phantom forward
-        # push, which tightens the barrier. Under executed throttle the
-        # coefficient is zero: throttle only ever adds forward acceleration,
-        # so the whole measured acceleration is carried as the autonomous
-        # term, overstating what alpha = 0 would sustain -- again the
-        # conservative direction. (A secant estimate here was measured
-        # permissive at speed, where the power-limited plant delivers less
-        # than the tire-capacity secant and the shortfall was booked as free
-        # deceleration.) The barrier's a_x_auto reduces to
-        # a_meas - g_nom*min(alpha_exec, 0), continuous across the pedal
-        # transition and independent of the desired command.
-        f_drag = self._resistive_acceleration(nn_forces, v_meas)
-        g_thrust = self._longitudinal_authority(v, v_lat, omega, delta,
-                                                nn_forces)
-
-        alpha_exec = float(np.clip(self._alpha, -1.0, 1.0))
-        g_nom = 0.0 if alpha_exec >= 0 else self._BRAKE_NOMINAL_ENVELOPE
-        hdv0 = self.dob.update(v, alpha_exec, self.control_dt,
-                               f_nom_override=f_drag + g_nom * alpha_exec)
-
-        # Terrain-aware speed limit
-        v_max_terrain = self._compute_terrain_speed_limit(v, terrain_roughness, delta)
-
-        # ---- Position-based QP formulation ----
-        # QP variables: u = [steer_out, alpha_out]
-        #   steer_out: normalized steering position [-1, 1]
-        #   alpha_out: throttle/brake [-1, 1]
-        # u_desired = [desired_steering, alpha_cmd]
-        #
-        # The decision variable is the steering position rather than its rate.
-        # Optimizing over the rate would place a barrier-tracking feedback loop
-        # in series with the QP's own correction; the two then oppose each
-        # other on the steering channel, and the QP settles on braking even
-        # where a steering correction is available.
-
-        desired_alpha = alpha_cmd
-        u_desired = np.array([desired_steering, desired_alpha])
-
-        # Current road-wheel angle for barrier linearization
-        # Use last applied steering as best estimate of current vehicle state
-        current_beta = self._beta
-
-        # Build heading-aligned weight matrix P
-        cos_psi = np.cos(psi)
-        sin_psi = np.sin(psi)
-        R = np.array([[cos_psi, sin_psi],
-                       [-sin_psi, cos_psi]])
-        Q_barrier = np.diag([self.w_long, self.w_lat])
-        P = R.T @ Q_barrier @ R
-
-        # NN-informed dynamics for CBF constraints
-        # Autonomous lateral acceleration and yaw moment from NN
-        if nn_forces is not None:
-            # NN provides actual tire-generated accelerations at current state
-            ay_tire = nn_forces['ay_nn']          # lateral accel from Fy (m/s^2)
-            alpha_dot_tire = nn_forces['alpha_dot']  # yaw accel from Mz (rad/s^2)
-        else:
-            ay_tire = 0.0
-            alpha_dot_tire = 0.0
-
-        # Steering sensitivity: how much lateral force / yaw per unit delta change
-        if nn_steer_sens is not None:
-            dFy_ddelta, dMz_ddelta = nn_steer_sens
-            # Convert to accelerations per unit dbeta (dbeta = ddelta/dt, so
-            # sensitivity is per unit delta; multiply by control_dt handled in QP)
-            day_ddelta = dFy_ddelta / self.M
-            dalpha_dot_ddelta = dMz_ddelta / self.Izz
-        else:
-            # Kinematic fallback: d(omega)/dt ~ v/L * ddelta
-            day_ddelta = 0.0
-            dalpha_dot_ddelta = v / self.L
-
-        # Longitudinal control authority: how much acceleration one unit of
-        # alpha buys, from the state-only drive-slip secant. A function of the
-        # command here would make the safe set change shape with the pedal.
-        accel_gain = g_thrust
-
-        # Build CBF constraints for each nearby obstacle
-        A_ineq_list = []
-        b_ineq_list = []
-        min_h = float('inf')
-        threat_is_vehicle = False   # type of the most-threatening (min-h) obstacle
-        self._pending_obs_logs = []
-
-        # Expand obstacle filtering range to cover delay-inflated buffer
-        delay_inflate = effective_buffer - self.obstacle_buffer
-        r_precpt_eff = self.r_precpt + delay_inflate
-
-        for _oi, (obs_x, obs_y, obs_r) in enumerate(obstacles):
-            # Distance check -- skip far obstacles
-            dd = (x - obs_x)**2 + (y - obs_y)**2
-            if dd > r_precpt_eff**2:
-                continue
-
-            safe_r = obs_r + self.vehicle_radius + effective_buffer
-
-            # ----------------------------------------------------------
-            # Position-based CBF: steering enters through h_dot (1st
-            # derivative) via omega = v/L * tan(beta).  Throttle enters
-            # through h_ddot (2nd derivative) via acceleration.
-            #
-            # Constraint (2nd-order CBF):
-            #   h_ddot + alpha2 * h_dot(steer_out) + alpha1 * h >= 0
-            #
-            # h_dot is linearized around current_beta:
-            #   h_dot(s) ≈ h_dot_0 + A_steer * (s - s_current)
-            # where s is the normalized steering output and
-            #   A_steer = dh_dot/ds = dh_dot/d(omega) * d(omega)/d(s)
-            # ----------------------------------------------------------
-
-            beta = current_beta
-            w1 = self.w_long
-            w2 = self.w_lat
-            bias = self.forward_bias
-
-            # Body-frame decomposition
-            raw_dx = x - obs_x
-            raw_dy = y - obs_y
-            d_along = cos_psi * raw_dx + sin_psi * raw_dy + bias
-            d_cross = -sin_psi * raw_dx + cos_psi * raw_dy
-
-            # Barrier value
-            h = w1 * d_along**2 + w2 * d_cross**2 - safe_r**2
-            if h < min_h:
-                min_h = h
-                threat_is_vehicle = obs_is_vehicle[_oi]
-
-            # Euclidean distance from vehicle CG to obstacle center
-            dist_eucl = np.sqrt(dd)
-
-            # Kinematic quantities at current beta
-            # Use actual measured yaw rate for barrier dynamics — the
-            # kinematic bicycle model (omega_kin = v/L*tan(delta)) is
-            # inaccurate on low-friction surfaces where tire slip causes
-            # the real yaw rate to diverge from the kinematic prediction.
-            d_along_unbiased = d_along - bias
-
-            # The measured speed, not the /0 guard. Reusing the guard as a
-            # kinematic rate models a stopped vehicle as closing on the
-            # obstacle at 0.1 m/s, which alone is enough to keep the barrier
-            # constraint active and its argument negative at a standstill.
-            d_along_dot = v_meas + omega * d_cross
-            d_cross_dot = v_lat - omega * d_along_unbiased
-
-            h_dot = 2 * w1 * d_along * d_along_dot + 2 * w2 * d_cross * d_cross_dot
-
-            # Drop obstacles the vehicle is receding from (h increasing while
-            # the barrier is already satisfied).
-            if h_dot > 0 and h > 0:
-                continue
-
-            # Drop an obstacle behind the vehicle only when it is also receding
-            # (h_dot > 0), that is, already passed. One behind but closing
-            # (h_dot < 0) stays in the QP, so coverage is omnidirectional on
-            # demand while the forward bias continues to concentrate the scarce
-            # grip-limited margin in the direction of travel.
-            if d_along_unbiased > 1.0 and h_dot > 0:
-                continue
-
-            # Drop a receding obstacle even at h < 0, where the vehicle has
-            # passed it but the barrier ellipse still overlaps.
-            if h_dot > 0 and d_along_unbiased > -0.5:
-                continue
-
-            # Strict barrier value. Feasibility when deep inside the barrier is
-            # handled by the QP's penalized slack variable (below), not by
-            # relaxing the constraint here -- so the CBF never abandons its own
-            # forward-invariance guarantee. A mild floor only keeps the
-            # constraint magnitude numerically sane at gross violation.
-            h_eff = max(h, -safe_r**2)
-
-            # Steering sensitivity: dh_dot / d(steer_normalized)
-            # Uses kinematic model for control authority (how steering
-            # changes omega), which is a vehicle design property.
-            tan_beta = np.tan(beta) if abs(beta) < 1.5 else np.sign(beta) * 1e3
-            sec2_beta = 1.0 + tan_beta**2
-            d_omega_d_steer = v / self.L * sec2_beta * self.max_road_steer_angle
-
-            # dh_dot/d(omega) = 2*d_cross*(w1*d_along - w2*d_along_unbiased)
-            dh_dot_d_omega = 2 * d_cross * (w1 * d_along - w2 * d_along_unbiased)
-
-            A_steer = dh_dot_d_omega * d_omega_d_steer
-
-            # Autonomous h_ddot (second derivative at zero control). The
-            # longitudinal part is the control-independent half of the shared
-            # model: resistance plus the observer's residual. Omitting f_drag
-            # here while the observer subtracts it leaves the nominal counted
-            # once with the wrong sign, so hdv0 alone would report a phantom
-            # acceleration of -f_drag at every steady speed.
-            a_x_auto = f_drag + hdv0
-            omega_dot_auto = a_x_auto / self.L * tan_beta if abs(v_meas) > 0.1 else 0.0
-            d_along_ddot_auto = (a_x_auto
-                                 + d_cross_dot * omega
-                                 + d_cross * omega_dot_auto)
-            d_cross_ddot_auto = (-d_along_dot * omega
-                                 - d_along_unbiased * omega_dot_auto)
-            # The velocity-squared (centrifugal) terms are omitted from
-            # h_ddot_auto. The full chain-rule expansion of d²h/dt² contains
-            # d_along_dot² and d_cross_dot², both non-negative, which inflate
-            # h_ddot_auto — d_cross_dot² especially so in a turn — and leave
-            # the constraint non-binding: the barrier reads as improving on its
-            # own while the vehicle is only rotating its body frame, not gaining
-            # clearance. Retaining the position-times-acceleration terms alone
-            # keeps the constraint conservative enough to command braking or
-            # steering while either still has authority.
-            h_ddot_auto = (2 * w1 * d_along * d_along_ddot_auto
-                         + 2 * w2 * d_cross * d_cross_ddot_auto)
-
-            # Throttle sensitivity: alpha affects h_ddot through acceleration
-            A_alpha = 2 * w1 * d_along * accel_gain
-
-            # Position-based CBF constraint using effective barrier:
-            # h_ddot_auto + A_alpha*alpha + alpha2*(h_dot_0 + A_steer*(s - s_cur)) + alpha1*h_eff >= 0
-            #
-            # Rearrange to: -[alpha2*A_steer, A_alpha] @ [s, alpha] <= psi0
-            s_current = self._beta / self.max_road_steer_angle
-            psi0 = (h_ddot_auto
-                    + self.alpha2 * (h_dot - A_steer * s_current)
-                    + self.alpha1 * h_eff)
-            psi1 = np.array([self.alpha2 * A_steer, A_alpha])
-
-            # QP variable u = [steer_out, alpha_out, slack]. The CBF constraint
-            #   psi1 @ [steer, alpha] + slack >= -psi0
-            # is kept for every obstacle; the (heavily penalized) slack only
-            # activates when the barrier is already violated and cannot be fully
-            # recovered, so the QP always drives toward safety -- braking when
-            # steering alone cannot -- instead of dropping the constraint.
-            A_ineq_list.append(np.array([-psi1[0], -psi1[1], -1.0]))
-            b_ineq_list.append(psi0)
-
-            # Buffer obstacle data for CSV (logged only if intervention occurs)
-            self._pending_obs_logs.append((
-                self._filter_count, obs_x, obs_y, obs_r, np.sqrt(dd),
-                d_along, d_cross, d_along_unbiased,
-                h, h_dot, h_ddot_auto,
-                A_steer, A_alpha, psi0,
-                psi1[0], psi1[1],
-            ))
-
-        if self.braking_barrier:
-            ub = self._braking_alpha_bound(x, y, psi, v, omega, obstacles,
-                                           effective_buffer, accel_gain)
-            self._last_brake_ub = ub
-            if ub < 1.0:
-                A_ineq_list.append(np.array([0.0, 1.0, 0.0]))
-                b_ineq_list.append(ub)
-                if ub < desired_alpha:
-                    self._brake_rows_binding += 1
-
-        # Speed limit constraint (terrain-aware). Column 3 is the CBF slack,
-        # which does not enter the speed limit. Throttle is what drives the
-        # speed up, so the row bounds alpha from *above*; a negated
-        # coefficient here turns the cap into a floor that strips the
-        # driver's braking and, past the limit, demands throttle. The bound
-        # is floored at the most negative alpha the *rate* limits allow this
-        # step -- not merely at full brake -- because a row the rate rows
-        # cannot satisfy makes the whole QP infeasible and trips the
-        # emergency fallback, which discards every obstacle constraint. A
-        # step arriving over the cap at high throttle then sheds alpha at the
-        # rate limit instead of losing its steering for a step.
-        if v > v_max_terrain * 0.9:
-            speed_margin = v_max_terrain - v
-            accel_for_speed = accel_gain
-            _a_cur = float(np.clip(self._alpha, -1.0, 1.0))
-            _da = self.max_alpha_rate * self.control_dt
-            alpha_floor = max(-1.0, _a_cur - _da)
-            A_ineq_list.append(np.array([0.0, accel_for_speed, 0.0]))
-            b_ineq_list.append(
-                max(self.alpha1 * speed_margin,
-                    accel_for_speed * alpha_floor))
-
-        # The barrier constraints are never dropped, not even at near-zero
-        # speed inside the barrier. Dropping them there would let a persistent
-        # operator throttle creep the vehicle into a head-on obstacle. The
-        # penalized slack below supplies feasibility instead, so the optimizer
-        # brakes to hold the standoff without the constraint being relaxed.
-
-        # Solve QP
-        was_modified = False
-        active_constraints = 0
-        qp_success = True
-
-        if len(A_ineq_list) > 0:
-            A_ineq = np.array(A_ineq_list)   # 3 columns: [steer, alpha, slack]
-            b_ineq = np.array(b_ineq_list)
-
-            # Actuator limits on [steer, alpha] plus a physical steering/throttle
-            # rate limit baked into the QP so the CBF only plans control it can
-            # actually execute. The slack (column 3) is bounded below by 0 only.
-            s_cur = float(np.clip(self._beta / self.max_road_steer_angle, -1.0, 1.0))
-            dmax = self.max_steer_rate * self.control_dt / self.max_road_steer_angle
-            a_cur = float(np.clip(self._alpha, -1.0, 1.0))
-            da = self.max_alpha_rate * self.control_dt
-            A_limits = np.array([
-                [1.0, 0.0, 0.0],   # steer_out <= 1
-                [-1.0, 0.0, 0.0],  # -steer_out <= 1
-                [0.0, 1.0, 0.0],   # alpha_out <= 1
-                [0.0, -1.0, 0.0],  # -alpha_out <= 1
-                [1.0, 0.0, 0.0],   # steer rate up
-                [-1.0, 0.0, 0.0],  # steer rate down
-                [0.0, 1.0, 0.0],   # alpha rate up
-                [0.0, -1.0, 0.0],  # alpha rate down
-                [0.0, 0.0, -1.0],  # -slack <= 0  (slack >= 0)
-            ])
-            b_limits = np.array([1.0, 1.0, 1.0, 1.0,
-                                 min(1.0, s_cur + dmax),
-                                 min(1.0, dmax - s_cur),
-                                 min(1.0, a_cur + da),
-                                 min(1.0, da - a_cur),
-                                 0.0])
-
-            A_all = np.vstack([A_ineq, A_limits])
-            b_all = np.hstack([b_ineq, b_limits])
-
-            u_desired3 = np.array([desired_steering, desired_alpha, 0.0])
-
-            # Cost: min ||[steer,alpha] - u_desired||^2_W + rho * slack^2.
-            # The steer/alpha weights express a tracking preference only
-            # (steering cheaper than braking for a static rock); they do not
-            # weaken the barrier, which is a hard constraint softened solely by
-            # the heavily penalized slack. Where steering cannot maintain the
-            # barrier -- a head-on obstacle on low-grip soil, for instance --
-            # the optimizer brakes to minimize the violation, with no special
-            # case in the code.
-            if self.cbf_flavor == 'steer_priority':
-                Wd = [500.0, 1.0]
-            elif self.cbf_flavor == 'throttle_priority':
-                Wd = [1.0, 500.0]
-            elif self.cbf_flavor == 'balance' and not threat_is_vehicle:
-                Wd = [1.0, 10.0]
-            else:
-                Wd = [1.0, 1.0]
-            rho_slack = 1.0e4
-            W3 = np.diag([Wd[0], Wd[1], rho_slack])
-            H = 2.0 * W3
-            f = -2.0 * W3 @ u_desired3
-
-            def qp_objective(u_var):
-                return 0.5 * u_var @ H @ u_var + f @ u_var
-
-            constraints = [{
-                'type': 'ineq',
-                'fun': lambda u_var: b_all - A_all @ u_var
-            }]
-
-            result = minimize(
-                qp_objective, u_desired3,
-                method='SLSQP',
-                constraints=constraints,
-                options={'maxiter': 60, 'ftol': 1e-8}
-            )
-
-            if result.success:
-                u_safe = result.x[:2]
-                diff = np.linalg.norm(u_safe - u_desired)
-                was_modified = diff > 1e-4
-                if was_modified:
-                    self._modify_count += 1
-                    active_constraints = sum(
-                        1 for i in range(len(A_ineq))
-                        if A_ineq[i] @ result.x > b_ineq[i] - 1e-3
-                    )
-            else:
-                # Solver failure: emergency brake, hold steering.
-                u_safe = np.array([desired_steering, -1.0])
-                was_modified = True
-                qp_success = False
-                self._modify_count += 1
-                active_constraints = len(A_ineq_list)
-        else:
-            u_safe = u_desired
-
-        # Extract filtered controls directly (position-based, no integration)
-        safe_steering = np.clip(u_safe[0], -1.0, 1.0)
-        safe_alpha = u_safe[1]
-
-        # Reactive steering layer: add avoidance commands for nearby obstacles.
-        # This handles head-on obstacles where the CBF geometric singularity
-        # prevents the QP from choosing steering, and provides guidance during
-        # low-speed creeping through obstacle fields.
-        if len(obstacles) > 0 and min_h < 2.0:
-            reactive_steer = self._compute_reactive_steering(vehicle_state, obstacles)
-            if abs(reactive_steer) > 0.01:
-                # A driver already steering away from the obstacle is not
-                # overridden; the layer engages only when the driver is passive
-                # or steering toward it.
-                driver_avoiding = (abs(desired_steering) > 0.2
-                                   and np.sign(desired_steering) == np.sign(reactive_steer))
-                if not driver_avoiding:
-                    safe_steering = np.clip(safe_steering + reactive_steer, -1.0, 1.0)
-                    if not was_modified:
-                        was_modified = True
-                        self._modify_count += 1
-
-        # Teleop: forward-predict over delay horizon and emergency-brake
-        # if the QP-safe output still leads to a collision within the RTT
-        if self._teleop_delay > 0.0 and len(obstacles) > 0:
-            pred_horizon = 2.0 * self._teleop_delay + 0.3  # RTT + reaction
-            pred_steps = max(int(pred_horizon / 0.1), 1)
-            preds = self.predict_state(
-                vehicle_state, safe_steering,
-                max(safe_alpha, 0.0), dt=0.1, steps=pred_steps)
-            collision, t_collide = self.check_predicted_collision(preds, obstacles)
-            if collision:
-                # Override to emergency brake; keep steering
-                safe_alpha = -1.0
-                was_modified = True
-                if not qp_success or active_constraints == 0:
-                    active_constraints = 1
-
-        # Steering-actuator model. A physical steering rack cannot snap between
-        # angles, so the commanded steering passes through (1) a hard slew-rate
-        # cap and (2) a first-order lag of time constant steer_tau. The lag
-        # matters because the QP and the reactive layer can select opposite
-        # avoidance solutions on consecutive solves a few milliseconds apart;
-        # that alternation is high-frequency and the lag attenuates it into a
-        # single steady command, while a sustained operator or avoidance input
-        # is low-frequency and passes through with only the actuator's small
-        # delay. The interval between calls is measured on the filter's clock
-        # (wall time unless set_clock() supplied simulation time), so both the
-        # cap and the lag are correct at the rate the filter actually runs.
-        # With the default wall clock this is the call's start time, as published.
-        t_clock = t_start if self._clock is time.time else self._clock()
-        dt_call = (t_clock - self._last_filter_wall) if self._last_filter_wall else self.control_dt
-        self._last_filter_wall = t_clock
-        dt_call = float(np.clip(dt_call, 0.005, 0.1))
-        prev = self._last_safe_steering
-        # 1) first-order lag toward the full target -- passes the steady (human /
-        #    sustained-avoidance) component, attenuates the high-frequency QP/
-        #    reactive flip-flop.
-        a = dt_call / (self.steer_tau + dt_call)
-        smoothed = prev + a * (safe_steering - prev)
-        # 2) hard slew cap as a physical backstop (won't bind on normal input).
-        max_dsteer = self.max_steer_rate * dt_call / self.max_road_steer_angle
-        smoothed = float(np.clip(smoothed, prev - max_dsteer, prev + max_dsteer))
-        if abs(smoothed - safe_steering) > 1e-4:
-            was_modified = True
-        safe_steering = smoothed
-        self._last_safe_steering = safe_steering
-
-        # Track applied steering for next call's linearization point
-        self._beta = safe_steering * self.max_road_steer_angle
-        self._alpha = safe_alpha
-
-        if safe_alpha >= 0:
-            safe_throttle = min(safe_alpha, 1.0)
-            safe_brake = 0.0
-        else:
-            safe_throttle = 0.0
-            safe_brake = min(abs(safe_alpha), 1.0)
-
-        # --- Rear-approach avoidance ---
-        # A vehicle closing from behind cannot always be avoided, but slowing
-        # down raises the rear-end risk rather than lowering it. The nearest
-        # obstacle behind the ego and inside its lane is located; if it is
-        # closing within the threat distance, deceleration is refused, and when
-        # the path ahead is clear the throttle ramps with proximity to open the
-        # gap, including from a standstill.
-        rear_dist = float('inf')
-        fwd_dist = float('inf')
-        cps, sps = np.cos(psi), np.sin(psi)
-        for (obs_x, obs_y, obs_r) in obstacles:
-            rx, ry = obs_x - x, obs_y - y
-            lon = rx * cps + ry * sps            # +forward in body frame
-            lat = -rx * sps + ry * cps
-            d = float(np.hypot(rx, ry)) - obs_r
-            if abs(lat) < self._rear_half_w:
-                if lon < -1.0:
-                    rear_dist = min(rear_dist, d)
-                elif lon > 0.0:
-                    fwd_dist = min(fwd_dist, d)
-        rear_closing = rear_dist < self._prev_rear_dist - 0.02
-        self._prev_rear_dist = rear_dist if np.isfinite(rear_dist) else float('inf')
-        if rear_dist < self._rear_threat_dist and rear_closing:
-            safe_brake = 0.0                     # never brake into a rear approach
-            if fwd_dist > self._rear_threat_dist:  # path ahead clear -> accelerate away
-                escape = float(np.clip(1.2 - rear_dist / self._rear_threat_dist, 0.4, 1.0))
-                safe_throttle = max(safe_throttle, desired_throttle, escape)
-            else:                                  # blocked ahead -> at least don't slow
-                safe_throttle = max(safe_throttle, desired_throttle)
-            was_modified = True
-
-        solve_time = (time.time() - t_start) * 1000
-
-        self._last_result = SafetyFilterResult(
-            steering=safe_steering,
-            throttle=safe_throttle,
-            braking=safe_brake,
-            was_modified=was_modified,
-            active_constraints=active_constraints,
-            solve_time_ms=solve_time,
-            v_max_terrain=v_max_terrain,
-            safety_margin=min_h if min_h < float('inf') else float('inf'),
-            dob_norm=abs(hdv0),
-        )
-
-        # CSV log only when filter intervenes
-        if was_modified:
-            self._log_csv_main(
-                self._filter_count, x, y, psi, v, self._beta, hdv0,
-                len(obstacles), len(A_ineq_list), min_h,
-                desired_steering, desired_throttle, desired_brake,
-                safe_steering, safe_throttle, safe_brake,
-                alpha_cmd, safe_alpha,
-                was_modified, active_constraints, solve_time,
-                qp_success, v_max_terrain,
-            )
-            # Flush buffered obstacle logs for this intervention
-            for obs_log in self._pending_obs_logs:
-                self._log_csv_obstacle(*obs_log, skipped_hdot=False, skipped_far=False)
-
-        # Diagnostic logging (only when filter intervenes)
-        if was_modified and self._filter_count % 20 == 0:
-            n_obs = len(obstacles)
-            mod_tag = " ** MODIFIED **" if was_modified else ""
-            n_constraints = len(A_ineq_list)
-            delay_tag = f" delay={self._teleop_delay*1000:.0f}ms buf={effective_buffer:.2f}m" if self._teleop_delay > 0 else ""
-            print(f"  [CBF #{self._filter_count}] v={v:.2f} pos=({x:.1f},{y:.1f}) psi={np.degrees(psi):.1f}°"
-                  f" | obs={n_obs} constraints={n_constraints} min_h={min_h:.2f} dob={hdv0:+.2f}"
-                  f" | IN steer={desired_steering:+.3f} thr={desired_throttle:.3f} brk={desired_brake:.3f}"
-                  f" | OUT steer={safe_steering:+.3f} thr={safe_throttle:.3f} brk={safe_brake:.3f}"
-                  f" | alpha_cmd={alpha_cmd:+.3f} -> safe_alpha={safe_alpha:+.3f}"
-                  f" | v_max_t={v_max_terrain:.1f}{delay_tag}{mod_tag}")
-
+        ms = (time.time() - t0) * 1e3
+        self._solve_ms_ema = 0.9 * self._solve_ms_ema + 0.1 * ms
+        self._last_result = SafetyFilterResult(steer, max(pedal, 0.0), max(-pedal, 0.0), bool(modified),
+                                               n_rows, ms, float("nan"), float(min_h), abs(self._d_hat))
         return self._last_result
 
-    def _braking_alpha_bound(self, x, y, psi, v, omega, obstacles,
-                             effective_buffer, g_thrust) -> float:
-        """Upper bound on alpha from the braking-distance barrier rows.
+    def filter(self, desired_steering, desired_throttle, desired_brake, vehicle_state, obstacles=None, **_):
+        t0 = time.time()
+        self._filter_count += 1
+        s_op = float(np.clip(desired_steering, -1.0, 1.0))
+        pedal_op = float(np.clip(float(desired_throttle) - float(desired_brake), -1.0, 1.0))
+        X = float(vehicle_state.get("x", 0.0))
+        Y = float(vehicle_state.get("y", 0.0))
+        psi = float(vehicle_state.get("psi", 0.0))
+        v = max(float(vehicle_state.get("u", 0.0)), 0.0)
+        p = self._pedal
 
-        For each obstacle ahead whose footprint overlaps the vehicle's lane,
-        h_b = gap - v^2 / (2 a_h), and the first-order condition
-        dh_b/dt + gamma h_b >= 0 with dv/dt = a_h alpha (braking) reads
-        alpha <= (gamma h_b - v_c) / v, where v_c is the closing speed of the
-        gap. Under throttle dv/dt = g_thrust alpha, which rescales the bound by
-        a_h / g_thrust. The sensing-range row is the same with the gap fixed at
-        the sensed radius. The bound is clipped at the most negative alpha the
-        rate limit allows this step, so the row can never make the QP
-        infeasible, and full braking is what remains when nothing else can
-        restore the barrier.
-        """
-        a_h = max(self.brake_margin * self._a_soil, 0.3)
-        g_t = max(float(g_thrust), 0.3)
-        v_s = max(float(v), 0.5)
-        gam = self.gamma_brake
+        # Observer: the model's mean du/dt over the last period, the measured speed.
+        if self._xi is None:
+            self._xi = v
+        self._d_hat = self.k_obs * (v - self._xi)
+        self._xi += self.dt * (self._a_mean + self._d_hat)
+        self._t_obs += self.dt
+        sigma = self.sigma + max(0.0, self.e0 - self.sigma) * np.exp(-self.k_obs * self._t_obs)
 
-        def bound(r):
-            if r >= 0.0:
-                return r / v_s * min(1.0, a_h / g_t)
-            return r / v_s
+        if self._is_command_stale():
+            self._stale_brake_count += 1
+            return self._result(self._delta, -1.0, True, 0, t0, self._last_min_h)
 
-        ub = float('inf')
-        cps, sps = np.cos(psi), np.sin(psi)
-        for o in obstacles:
-            ox, oy, orad = float(o[0]), float(o[1]), float(o[2])
-            rx, ry = ox - x, oy - y
-            lon = rx * cps + ry * sps
-            lat = -rx * sps + ry * cps
-            if lon <= 0.0 or abs(lat) > orad + self.corridor_half_width + effective_buffer:
-                continue
-            gap = lon - (orad + self.front_extent + effective_buffer)
-            h_b = gap - v * v / (2.0 * a_h)
-            v_c = v - omega * lat
-            ub = min(ub, bound(gam * h_b - v_c))
-        if self.sense_range > 0.0:
-            r_eff = self.sense_range - (self.unseen_obstacle_radius
-                                        + self.front_extent + effective_buffer)
-            h_s = r_eff - v * v / (2.0 * a_h)
-            ub = min(ub, bound(gam * h_s))
-        a_cur = float(np.clip(self._alpha, -1.0, 1.0))
-        a_floor = max(-1.0, a_cur - self.max_alpha_rate * self.control_dt)
-        return float(min(max(ub, a_floor), 1.0))
+        obs = []
+        for o in obstacles or ():
+            vox, voy = (float(o[4]), float(o[5])) if len(o) >= 6 else (0.0, 0.0)
+            speed = float(np.hypot(vox, voy))
+            if len(o) >= 7:
+                hx, hy = np.cos(float(o[6])), np.sin(float(o[6]))
+                speed = max(vox * hx + voy * hy, 0.0)
+            elif speed > 1e-9:
+                hx, hy = vox / speed, voy / speed
+            else:
+                hx, hy = 1.0, 0.0
+            vehicle = bool(o[3]) if len(o) >= 4 else False
+            obs.append((float(o[0]), float(o[1]), float(o[2]), vox, voy, hx, hy, speed, vehicle))
 
-    def _compute_terrain_speed_limit(self, speed: float, roughness: float,
-                                      delta: float) -> float:
-        """
-        Compute terrain-aware maximum safe speed.
+        g_along = self._gravity(vehicle_state, v, p)
 
-        Uses terrain roughness and (optionally) NN tire force
-        predictions to determine the maximum speed that maintains vehicle
-        stability on the current terrain.
-        """
-        # Base speed limit from terrain roughness
-        if roughness > 0.01:
-            roughness_factor = 1.0 / (1.0 + 10.0 * roughness)
-            v_max_rough = self.max_speed * roughness_factor
+        # Input box: the steering and pedal rate limits over one period, the soil's cornering authority.
+        d_lim = self.max_steer
+        if v > 0.5:
+            d_lim = min(d_lim, float(np.arctan(self._a_lat * self.L / (v * v))))
+        d_lo = max(-d_lim, self._delta - self.steer_step)
+        d_hi = min(d_lim, self._delta + self.steer_step)
+        if d_lo > d_hi:
+            d_lo = d_hi = float(np.clip(np.sign(self._delta) * d_lim, self._delta - self.steer_step,
+                                        self._delta + self.steer_step))
+        q_lo, q_hi = max(-1.0, p - self.pedal_step), min(1.0, p + self.pedal_step)
+
+        # The condition is the discrete-time one of a filter whose input is held over its period (Agrawal and
+        # Sreenath 2017): h at the end of the period >= (1 - gamma dt) h now. The end state comes from the model
+        # for the pedal ramped to q at the rate limit and the wheel angle held, for q at the box's ends and at
+        # hold. h is concave in q (it stays flat until the throttle overcomes the soil's resistance, then drops),
+        # so the two secants through those points, as two rows, lie below it. The wheel angle enters through the
+        # end heading, linearly.
+        tan_app = float(np.tan(self._delta))
+
+        def mean_rate(q):
+            sub = np.linspace(0.0, 1.0, 5)
+            return float(np.mean(self._rate(p + sub * (q - p), np.full(5, v), g_along)))
+
+        def end_state(q, tan_d=tan_app, frac=1.0):
+            hstep = frac * self.dt
+            v_e = max(v + hstep * (mean_rate(p + frac * (q - p)) + self._d_hat), 0.0)
+            psi_e = psi + hstep * v * tan_d / self.L
+            X_e = X + hstep * 0.5 * (v + v_e) * np.cos(0.5 * (psi + psi_e))
+            Y_e = Y + hstep * 0.5 * (v + v_e) * np.sin(0.5 * (psi + psi_e))
+            return X_e, Y_e, psi_e, v_e, p + frac * (q - p)
+
+        qs = [q_lo, p, q_hi]
+        ends = [end_state(q) for q in qs]
+        ev, epsi = 0.05, 0.005
+        hold = ends[1]
+        # The sampled-data margin: |h''| over the period at the corners of the input box (second differences).
+        corners = [(dl, q) for dl in (d_lo, d_hi) for q in (q_lo, q_hi)]
+        mids = [end_state(q, np.tan(dl), 0.5) for dl, q in corners]
+        cends = [end_state(q, np.tan(dl), 1.0) for dl, q in corners]
+        states = ends + [(hold[0], hold[1], hold[2], hold[3] + ev, hold[4]),
+                         (hold[0], hold[1], hold[2], max(hold[3] - ev, 0.0), hold[4])] + mids + cends
+        vs = np.array([st[3] for st in states])
+        ps = np.array([st[4] for st in states])
+        s_now, t_now = self._stop(np.array([v]), np.array([p]), g_along)
+        s_m, t_stop = self._stop(vs, ps, g_along)
+        self._last_stop = float(s_now[0])
+
+        def h_of(st, i, dt_obs, dpsi=0.0):
+            return self._h(np.array(st[0]), np.array(st[1]), np.array(st[2] + dpsi), s_m[i], t_stop[i], obs, dt_obs)
+        h0 = self._h(np.array(X), np.array(Y), np.array(psi), s_now[0], t_now[0], obs, 0.0)
+        h_end = [h_of(ends[k], k, self.dt) for k in range(3)]
+        h_v = (h_of(states[3], 3, self.dt) - h_of(states[4], 4, self.dt)) / max(vs[3] - vs[4], 1e-9)
+        h_psi = (h_of(hold, 1, self.dt, epsi) - h_of(hold, 1, self.dt, -epsi)) / (2 * epsi)
+        L_dd = np.zeros_like(h0)
+        n_c = len(corners)
+        for k in range(n_c):
+            h_m = h_of(mids[k], 5 + k, 0.5 * self.dt)
+            h_e = h_of(cends[k], 5 + n_c + k, self.dt)
+            L_dd = np.maximum(L_dd, np.abs(h_e - 2.0 * h_m + h0) / (0.5 * self.dt) ** 2)
+        margin = 0.5 * L_dd * self.dt ** 2
+        h = h0 - margin
+        self._last_margin = float(margin.max()) if len(margin) else 0.0
+
+        # Rows c_w w + c_q q <= rhs in w = tan(delta), q = the pedal commanded for the end of the period:
+        # h_end(hold) + slope (q - p) + h_psi dt v (w - tan_app) / L - |h_v| sigma dt - margin >= (1 - gamma dt) h.
+        rows = []
+        decay = 1.0 - self.gamma * self.dt
+        c_w = h_psi * self.dt * v / self.L
+        slopes = []
+        if q_hi > p + 1e-9:
+            slopes.append((h_end[2] - h_end[1]) / (q_hi - p))
+        if p > q_lo + 1e-9:
+            slopes.append((h_end[1] - h_end[0]) / (p - q_lo))
+        if not slopes:
+            slopes.append(np.zeros_like(h0))
+        for i in range(len(h)):
+            base = h_end[1][i] - c_w[i] * tan_app - abs(h_v[i]) * sigma * self.dt - margin[i] - decay * h[i]
+            for sl in slopes:
+                rows.append((-c_w[i], -sl[i], base - sl[i] * p))
+        min_h = float(h.min()) if len(h) else float("inf")
+        self._last_min_h = min_h
+
+        # z = (tan(delta) / tan(full lock), q): identity cost on the inputs scaled by their ranges.
+        A, bvec = [], []
+        for c_w, c_q, rhs in rows:
+            A.append([c_w * self.w_max, c_q])
+            bvec.append(rhs)
+        for row, rhs in (([1.0, 0.0], np.tan(d_hi) / self.w_max), ([-1.0, 0.0], -np.tan(d_lo) / self.w_max),
+                         ([0.0, 1.0], q_hi), ([0.0, -1.0], -q_lo)):
+            A.append(row)
+            bvec.append(rhs)
+        A, bvec = np.array(A), np.array(bvec)
+        delta_op = float(np.clip(s_op * self.max_steer, d_lo, d_hi))
+        authority_clip = abs(delta_op - np.clip(s_op * self.max_steer, self._delta - self.steer_step,
+                                                self._delta + self.steer_step)) > 1e-9
+        z_op = np.array([np.tan(delta_op) / self.w_max, float(np.clip(pedal_op, q_lo, q_hi))])
+        z = solve_qp_2d(z_op, A, bvec)
+        n_rows = len(rows)
+        if z is None:
+            self._infeasible_count += 1
+            delta_c, q = float(np.clip(0.0, d_lo, d_hi)), q_lo
+            modified = True
+        elif np.allclose(z, z_op, atol=1e-9):
+            # The command, as the actuators execute it, satisfies every row.
+            delta_c, q, modified = s_op * self.max_steer, pedal_op, authority_clip
+            if authority_clip:
+                delta_c = delta_op
         else:
-            v_max_rough = self.max_speed
+            delta_c, q, modified = float(np.arctan(z[0] * self.w_max)), float(z[1]), True
+        # The model's mean du/dt over this period, for the observer's next step.
+        q_eff = float(np.clip(q, q_lo, q_hi))
+        sub = np.linspace(0.0, 1.0, 5)
+        self._a_mean = float(np.mean(self._rate(p + sub * (q_eff - p), np.full(5, v), g_along)))
+        return self._result(delta_c, q, modified, n_rows, t0, min_h)
 
-        # NN tire model traction check (if available)
-        v_max_traction = self.max_speed
-        if self.nn_casadi is not None:
-            v_max_traction = self._nn_traction_speed_limit(speed, delta)
-
-        return max(min(v_max_rough, v_max_traction, self.max_speed), 2.0)
-
-    def _nn_traction_speed_limit(self, speed: float, delta: float) -> float:
-        """Estimate the maximum speed at which traction remains available.
-
-        The query uses a fixed moderate steering angle representative of an
-        evasive manoeuvre rather than the driver's current angle, so the limit
-        expresses the traction budget reserved for avoidance rather than the
-        demand of the turn presently being driven.
-        """
-        g = 9.81
-        Fz_f = self.M * g * self.Lr / self.L / 2.0
-        Fz_r = self.M * g * self.Lf / self.L / 2.0
-
-        alpha_max = 0.15  # ~8.6 deg
-
-        try:
-            _tkw = {}
-            if self._use_terrain_nn and self._terrain_n is not None:
-                _tkw = dict(n_terrain=self._terrain_n,
-                            terrain_params=self._terrain_params)
-            _, Fy_f = self.nn_casadi.predict_numeric(alpha_max, Fz_f, max(speed, 2.0), 0.0, **_tkw)
-            _, Fy_r = self.nn_casadi.predict_numeric(alpha_max, Fz_r, max(speed, 2.0), 0.0, **_tkw)
-
-            Fy_max = 2.0 * (abs(Fy_f) + abs(Fy_r))
-            if self._use_grip_scale:
-                Fy_max *= self._grip_scale
-            ay_max = Fy_max / self.M
-
-            # Use a fixed moderate evasion angle (~5 deg) to set the speed
-            # limit.  This avoids penalizing the driver's actual steering.
-            evasion_delta = 0.09  # ~5 deg road wheel
-            R = self.L / max(np.tan(evasion_delta), 0.01)
-            v_max = np.sqrt(ay_max * R)
-
-            return min(v_max, self.max_speed)
-
-        except Exception:
-            return self.max_speed
-
-    def predict_state(self, state: dict, steering: float, throttle: float,
-                      dt: float = 0.1, steps: int = 5) -> List[dict]:
-        """Forward-simulate vehicle state for look-ahead collision checking."""
-        x = state.get('x', 0.0)
-        y_pos = state.get('y', 0.0)
-        psi = state.get('psi', 0.0)
-        u = state.get('u', 0.5)
-
-        delta = steering * self.max_road_steer_angle
-        ax = 3.0 * throttle
-
-        predictions = []
-        for _ in range(steps):
-            x += u * np.cos(psi) * dt
-            y_pos += u * np.sin(psi) * dt
-            psi += (u / self.L) * np.tan(delta) * dt
-            u += ax * dt
-            u = max(u, 0.0)
-
-            predictions.append({
-                'x': x, 'y': y_pos, 'psi': psi, 'u': u
-            })
-
-        return predictions
-
-    def check_predicted_collision(self, predictions: List[dict],
-                                   obstacles: List[Tuple[float, float, float]]) -> Tuple[bool, float]:
-        """Check if predicted trajectory collides with any obstacle."""
-        for i, pred in enumerate(predictions):
-            for obs_x, obs_y, obs_r in obstacles:
-                safe_r = obs_r + self.vehicle_radius + self.obstacle_buffer
-                dist_sq = (pred['x'] - obs_x)**2 + (pred['y'] - obs_y)**2
-                if dist_sq < safe_r**2:
-                    return True, i * 0.1
-        return False, float('inf')
-
-    @property
     def intervention_rate(self) -> float:
-        """Fraction of filter calls that modified the input (0-1)."""
-        if self._filter_count == 0:
-            return 0.0
-        return self._modify_count / self._filter_count
+        return self._modify_count / self._filter_count if self._filter_count else 0.0
 
     def get_diagnostics(self) -> dict:
-        """Get diagnostic info for logging."""
-        result = self._last_result
-        return {
-            'filter_calls': self._filter_count,
-            'interventions': self._modify_count,
-            'intervention_rate': self.intervention_rate,
-            'last_solve_ms': result.solve_time_ms if result else 0.0,
-            'last_modified': result.was_modified if result else False,
-            'last_v_max_terrain': result.v_max_terrain if result else self.max_speed,
-            'last_safety_margin': result.safety_margin if result else float('inf'),
-            'last_active_constraints': result.active_constraints if result else 0,
-            'last_dob_norm': result.dob_norm if result else 0.0,
-            'braking_barrier': self.braking_barrier,
-            'a_soil': self._a_soil,
-            'a_soil_source': self._a_soil_source,
-            'brake_rows_binding': self._brake_rows_binding,
-        }
+        return {"filter_calls": self._filter_count,
+                "interventions": self._modify_count,
+                "intervention_rate": self.intervention_rate(),
+                "mean_solve_ms": self._solve_ms_ema,
+                "variant": self.variant,
+                "soil": self._soil,
+                "a_lat_max": self._a_lat,
+                "d_hat": self._d_hat,
+                "infeasible": self._infeasible_count,
+                "stale_brakes": self._stale_brake_count,
+                "sampled_data_margin": self._last_margin,
+                "backup_stop_model": self._last_stop,
+                "gamma": self.gamma}

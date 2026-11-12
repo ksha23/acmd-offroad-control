@@ -1,7 +1,7 @@
-# Identification of the derived filters' bounds
+# Identification of the safety filters' bounds
 
 The bounds in `simulation/safety/ident/plant_bounds_chrono9_box.json` (README of
-`simulation/safety`, "Derived parameters") come from these two scripts, run on
+`simulation/safety`, "Parameters") come from these two scripts, run on
 north's Chrono 9.0.0 (the plant of every study):
 
     python ident_runs.py <out>/cert_shafts --powertrain shafts --certificate

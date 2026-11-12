@@ -23,13 +23,23 @@ sessions, the numerical-convergence, drag-feedforward, and predictive-filter
 probes, and the human-in-the-loop demonstration session. Everything else under
 `results/` is untracked and regenerable.
 
+## Safety filters at this commit
+
+The paper's safety studies ran on the filters at tag `acmd2026-published`. At
+later commits the same drivers run the current filters
+(`simulation/safety/README.md`, history in `simulation/safety/HISTORY.md`),
+so their numbers differ from the paper's. The current filters write no per-call
+`cbf_filter_log.csv`, so the deviation means read from it (`mean_abs_dsteer`,
+`mean_abs_dthrottle`) are empty. `sim_diag.csv` carries the operator's and the
+filtered commands.
+
 ## Script map
 
 - **Paper-tier studies** (one per `run.py` command): `mpc_tire_model_sweep`,
   `tire_model_with_estimator_ablation`, `joint_n_phi_evidence`,
   `speed_profile_ablation`, `grit_adaptive_speed_matrix`,
   `safety_filter_sweep`, `convoy_counterfactual_eval`,
-  `latency_awareness_ablation`, `teleop_failure_modes`.
+  `teleop_failure_modes`.
 - **Estimator evidence chain**: `terrain_estimator_trace` (the sensor-only
   trace contract), `collect_terrain_estimator_traces`,
   `terrain_estimator_replay`, `develop_joint_estimator`,
@@ -38,7 +48,8 @@ probes, and the human-in-the-loop demonstration session. Everything else under
   plant truth by construction; truth joins only at scoring.
 - **Preregistered scorers** (pinned by name in the paper's evidence bundle):
   `score_promotion_endpoints`, `score_roughness_scope`,
-  `score_latency_ablation`.
+  `score_latency_ablation` (for the delay-awareness ablation's frozen results,
+  whose driver is at tag `acmd2026-published`).
 - **Figures and publication**: `make_paper_figures` (the four-figure tex
   contract), `publish_paper_figures` (the fail-closed publisher, which holds to
   the committed manifest selection), `publish_teleop_scenario_traces`,

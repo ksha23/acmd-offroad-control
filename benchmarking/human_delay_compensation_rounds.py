@@ -210,20 +210,6 @@ def parse_args() -> argparse.Namespace:
                         "driver POV -- faster than the ray-traced 'sensor' camera on "
                         "a large deformable terrain, so it allows more traffic at "
                         "real-time. 'sensor' adds modelled camera (downlink) latency.")
-    p.add_argument("--shield-horizon", type=int, default=12)
-    p.add_argument("--safety-buffer", type=float, default=0.25)
-    p.add_argument("--cbf-profile",
-                   choices=["conservative", "balanced", "permissive", "custom"],
-                   default="conservative",
-                   help="DOB-CBF intrusiveness preset for driving comparisons. "
-                        "conservative = max safety / most intrusive; balanced; "
-                        "permissive = least intrusive; custom = use the explicit "
-                        "--cbf-alpha / --cbf-forward-bias overrides. (Non-DOB-CBF "
-                        "filter types plug in here as they are added.)")
-    p.add_argument("--cbf-alpha", type=float, default=None,
-                   help="Override CBF class-K gain (higher = acts later = less intrusive).")
-    p.add_argument("--cbf-forward-bias", type=float, default=None,
-                   help="Override CBF barrier forward shift, m (lower = less intrusive).")
     p.add_argument("--auto-start", action="store_true",
                    help="Do not wait for Enter before each round.")
     p.add_argument("--dry-run", action="store_true",
@@ -481,29 +467,7 @@ def command_for_round(args: argparse.Namespace, run_dir: Path, idx: int, filter_
             "--rock-spawn-clear", str(args.rock_spawn_clear),
         ]
     if filter_name != "none":
-        # DOB-CBF intrusiveness presets, as (class-K alpha, forward bias in m).
-        # A higher alpha and a lower forward bias make the filter act later and
-        # closer to the hazard, so it intervenes less at the cost of a tighter
-        # safety margin. The presets name points on that trade-off, which the
-        # convoy studies characterize quantitatively.
-        _cbf_profiles = {
-            "conservative": (5.0, 3.0),
-            "balanced": (15.0, 1.0),
-            "permissive": (30.0, 1.0),
-        }
-        _alpha, _fbias = _cbf_profiles.get(args.cbf_profile, (5.0, 3.0))
-        if args.cbf_alpha is not None:
-            _alpha = args.cbf_alpha
-        if args.cbf_forward_bias is not None:
-            _fbias = args.cbf_forward_bias
-        cmd += [
-            "--safety-filter",
-            "--safety-flavor", filter_name,
-            "--safety-buffer", str(args.safety_buffer),
-            "--shield-horizon", str(args.shield_horizon),
-            "--cbf-alpha", str(_alpha),
-            "--cbf-forward-bias", str(_fbias),
-        ]
+        cmd += ["--safety-filter", "--safety-flavor", filter_name]
         if not profile_json:
             # In profile mode the sim samples the control channel and feeds
             # the sim-side filter; a fixed --teleop-delay would override it.

@@ -1,4 +1,4 @@
-"""The plant vehicle's specification, for filters that take no hand-set numbers (``--safety-derived``).
+"""The plant vehicle's specification, which the safety filters take their numbers from.
 
 Every number here is read from the Chrono 9.0.0 HMMWV model the simulator runs, or from the plant node's
 actuator limits. The README section "Derived parameters" lists the source of each.
@@ -26,17 +26,6 @@ MAX_ROAD_WHEEL = 0.49      # rad at full lock
 WHEEL_RADIUS = 0.467       # HMMWV_RigidTire
 BRAKE_TORQUE = 4000.0      # N m per wheel at full pedal, HMMWV_BrakeSimple / BrakeShafts
 CONICAL_RATIO = 0.2        # HMMWV_Driveline4WD: wheel speed over driveshaft speed
-
-
-def footprint_discs(n: int = 3):
-    """Centres (m, along the heading from the centre of mass) and common radius of n discs that cover the
-    body outline: n equal strips along the length, each covered by the disc through its corners."""
-    x0 = BODY_X_REF[0] - COM_X_REF
-    x1 = BODY_X_REF[1] - COM_X_REF
-    strip = (x1 - x0) / n
-    centres = tuple(x0 + (k + 0.5) * strip for k in range(n))
-    radius = float(np.hypot(0.5 * strip, BODY_HALF_WIDTH))
-    return centres, radius
 
 
 def _interp(x, xs, ys):

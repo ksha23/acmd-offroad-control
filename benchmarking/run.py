@@ -50,7 +50,6 @@ RESULT_PREFIX = {
     "safety": "safety_filter_sweep_planner_aware",
     "live_grit_integration": "safety_filter_sweep_live_grit_mpsf_paper",
     "convoy_cf": "convoy_counterfactual_eval",
-    "latency_awareness": "latency_awareness_ablation",
 }
 
 # A command's freshly generated result directory is the publication source for
@@ -167,7 +166,7 @@ def build_commands(args: argparse.Namespace) -> list[Command]:
     names = [
         "tire_models", "tire_models_calibrated", "tire_estimator", "terrain_estimator",
         "speed_profile", "grit_speed", "safety", "live_grit_integration",
-        "convoy_cf", "latency_awareness", "teleop_battery",
+        "convoy_cf", "teleop_battery",
     ]
     ports = {name: args.base_port + index * args.port_stride
              for index, name in enumerate(names)}
@@ -223,10 +222,6 @@ def build_commands(args: argparse.Namespace) -> list[Command]:
                     "0.6", "--convoy", "stalled", "--filters", "none", "dob_cbf",
                     "--delays", "0.0", "--time", "10", "--base-port", ports["convoy_cf"]),
                     2, "Paired counterfactual wiring"),
-            Command("latency_awareness", py("latency_awareness_ablation.py", "--convoy", "stalled",
-                    "--delays", "0.15", "--reckless-throttle", "0.6", "--time", "10",
-                    "--base-port", ports["latency_awareness"]), 3,
-                    "Blind/aware delay wiring"),
         ]
     else:
         values = matrix(args.tier)
@@ -304,16 +299,6 @@ def build_commands(args: argparse.Namespace) -> list[Command]:
                     "none", "dob_cbf", "--delays", "0.0", "0.1", "0.2", "0.3", "0.4",
                     "--base-port", ports["convoy_cf"]), 90,
                     "Table 3 convoy rows: paired convoy counterfactual"),
-            # The primary endpoint is the three moving-approach scenarios;
-            # lead_brake and rear_approach are the preregistered negative
-            # controls. The script's default scenario set contains none of the
-            # three, so it must be named explicitly or the paired endpoint has
-            # no cells to score.
-            Command("latency_awareness", py("latency_awareness_ablation.py",
-                    "--convoy", "oncoming", "jam", "double_cut",
-                    "lead_brake", "rear_approach",
-                    "--base-port", ports["latency_awareness"]), 90,
-                    "Sec. 4.2: paired delay-awareness ablation"),
             Command("teleop_battery", py("teleop_failure_modes.py", "--base-port",
                     ports["teleop_battery"]), 30,
                     "Table 4, Fig. 4: teleoperation failure-mode battery"),
