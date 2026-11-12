@@ -93,3 +93,23 @@ def test_wall_too_close_is_braked():
     r = f.filter(0.0, 0.8, 0.0, _state(45.0 - 14.0, 8.0), wall)
     assert r.was_modified
     assert r.braking > 0.0
+
+
+def test_downgrade_lowers_the_stopping_deceleration(clay_filter):
+    # Flat ahead keeps the soil value. A 10% downgrade from 5 m ahead gives
+    # a_h cos(theta) - g sin(theta) once the stop reaches it, and the chassis
+    # pitch alone gives the same for the whole stop.
+    f = clay_filter
+    s = np.arange(0.0, 40.01, 0.5)
+    flat = f._braking_decel({"terrain_ahead": (0.5, np.zeros_like(s))}, 6.0)
+    assert flat == pytest.approx(f._a_h)
+    h = -0.1 * np.maximum(s - 5.0, 0.0)
+    sin_t = 0.1 / np.sqrt(1.01)
+    want = f._a_h * np.sqrt(1.0 - sin_t ** 2) - 9.81 * sin_t
+    assert f._braking_decel({"terrain_ahead": (0.5, h)}, 6.0) == pytest.approx(want, rel=0.02)
+    assert f._braking_decel({"grade_now": sin_t}, 6.0) == pytest.approx(want, rel=1e-6)
+    # Ground a sensor has not seen counts as the steepest admissible downgrade.
+    unseen = np.where(s > 5.0, np.nan, 0.0)
+    sin_u = f.unknown_downgrade / np.sqrt(1.0 + f.unknown_downgrade ** 2)
+    want_u = f._a_h * np.sqrt(1.0 - sin_u ** 2) - 9.81 * sin_u
+    assert f._braking_decel({"terrain_ahead": (0.5, unseen)}, 6.0) == pytest.approx(want_u, rel=1e-6)

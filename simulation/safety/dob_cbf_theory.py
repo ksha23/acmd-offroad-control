@@ -34,6 +34,14 @@ Barriers.
   whenever h_b >= 0, so with these rows the QP stays feasible from the safe set.
 * The sensing edge: the same braking barrier with the gap fixed at the sensed
   range, so the vehicle never outruns what it can see.
+* Grade (the terrain-preview study). On a downgrade theta the stop has the
+  deceleration a_h cos(theta) - g sin(theta). Without a preview the ground is
+  taken as flat. With ``grade_now`` in the vehicle state (the chassis pitch)
+  that grade is held over the whole stop. With ``terrain_ahead`` (ground
+  heights along the heading) theta is the steepest downgrade, over one
+  wheelbase, between the vehicle and its stopping point. Unknown heights
+  (nan, ground a sensor has not seen) count as the steepest admissible
+  downgrade, ``unknown_downgrade`` (rise over run).
 
 QP. min (u - u_cmd)' W (u - u_cmd) over the input box (steering rate and
 authority, pedal rate), all rows hard. W is the paper's threat weighting. With
@@ -140,6 +148,7 @@ class TheoryCBFSafetyFilter:
                  max_accel: float = 3.0,
                  tau_long: float = 0.1,
                  max_speed: float = 15.0,
+                 unknown_downgrade: float = 0.15,
                  nn_model_dir: str = "nn_models/tire_force_static",
                  nominal_soil: str = "sand",
                  **_ignored):
@@ -169,6 +178,7 @@ class TheoryCBFSafetyFilter:
         self.max_accel = float(max_accel)
         self.tau_long = float(tau_long)
         self.max_speed = float(max_speed)
+        self.unknown_downgrade = float(unknown_downgrade)
         self._teleop_delay = max(float(teleop_delay), 0.0)
         self._stale_cmd_timeout = float(stale_cmd_timeout)
         self._clock = time.time
@@ -202,6 +212,7 @@ class TheoryCBFSafetyFilter:
         self._solve_ms_ema = 0.0
         self._last_result = None
         self._last_min_h = float("inf")
+        self._a_h_used = self._a_h
 
     # -- interface parity ---------------------------------------------------------
     def set_clock(self, clock):
@@ -288,7 +299,35 @@ class TheoryCBFSafetyFilter:
         return ca.Function("hocbf", [x, o, p1],
                            [h, h_dot, psi1, ca.mtimes(J, f0), J[3], J[4]])
 
-    def _rows(self, xs, obstacles, obs_vehicle, f_drag, sigma):
+    def _braking_decel(self, vehicle_state, v):
+        """Margined stopping deceleration on the grade ahead (m/s^2), see the module docstring."""
+        g = 9.81
+        if vehicle_state.get("terrain_ahead") is not None:
+            ds, h = vehicle_state["terrain_ahead"]
+            h = np.asarray(h, dtype=float)
+            k = max(1, int(round(self.L / ds)))
+            if len(h) <= k:
+                return self._a_h
+            down = (h[:-k] - h[k:]) / (k * ds)       # tan of the downgrade over one wheelbase
+            # Ground the map has not seen takes the steepest admissible downgrade.
+            down = np.where(np.isnan(down), self.unknown_downgrade, down)
+            a = self._a_h
+            # The stop's length depends on the deceleration and the deceleration
+            # on the grade over the stop: iterate from the flat value.
+            for _ in range(4):
+                stop = self.tau_b * v + v * v / (2.0 * a) + self.L
+                n = min(len(down), int(np.ceil(stop / ds)) + 1)
+                t_down = float(np.max(down[:n]))
+                s_down = float(np.clip(t_down / np.sqrt(1.0 + t_down * t_down), -0.5, 0.5))
+                c_th = np.sqrt(1.0 - s_down * s_down)
+                a = max(self._a_h * c_th - g * s_down, 0.2)
+            return a
+        if vehicle_state.get("grade_now") is not None:
+            s_down = float(np.clip(vehicle_state["grade_now"], -0.5, 0.5))
+            return max(self._a_h * np.sqrt(1.0 - s_down * s_down) - g * s_down, 0.2)
+        return self._a_h
+
+    def _rows(self, xs, obstacles, obs_vehicle, f_drag, sigma, a_h):
         """Barrier rows c_delta u_delta + c_a u_a <= b, and the nearest threat."""
         X, Y, psi, v, delta = xs
         rows = []
@@ -305,7 +344,7 @@ class TheoryCBFSafetyFilter:
         # Braking-distance rows: obstacles in the lane, and the sensing edge.
         c, s = np.cos(psi), np.sin(psi)
         omega = v * np.tan(delta) / self.L
-        k_v = self.tau_b + max(v, 0.0) / self._a_h
+        k_v = self.tau_b + max(v, 0.0) / a_h
         for ox, oy, orad, vox, voy in obstacles:
             rx, ry = ox - X, oy - Y
             lon, lat = rx * c + ry * s, -rx * s + ry * c
@@ -315,13 +354,13 @@ class TheoryCBFSafetyFilter:
             # The obstacle is not credited with stopping distance of its own (it
             # may stop at once), but its motion along the heading sets the
             # closing speed.
-            h_b = gap - v * self.tau_b - v * v / (2.0 * self._a_h)
+            h_b = gap - v * self.tau_b - v * v / (2.0 * a_h)
             v_c = v - (vox * c + voy * s) - omega * lat
             rows.append((0.0, k_v, self.gamma * h_b - v_c - k_v * (f_drag + self._d_hat + sigma)))
         if self.sense_range > 0.0:
             r_eff = self.sense_range - (self.unseen_obstacle_radius + self.front_extent
                                         + self.obstacle_buffer)
-            h_s = r_eff - v * self.tau_b - v * v / (2.0 * self._a_h)
+            h_s = r_eff - v * self.tau_b - v * v / (2.0 * a_h)
             rows.append((0.0, k_v, self.gamma * h_s - k_v * (f_drag + self._d_hat + sigma)))
         return rows, min_h, threat_vehicle
 
@@ -388,8 +427,10 @@ class TheoryCBFSafetyFilter:
                 v = max(v + h * (self._a_app + self._drag(v) + self._d_hat), 0.0)
             f_drag = self._drag(v)
         xs = np.array([X, Y, psi, max(v, 0.0), self._delta])
+        a_h = self._braking_decel(vehicle_state, max(v, 0.0))
+        self._a_h_used = a_h
 
-        rows, min_h, threat_vehicle = self._rows(xs, obs, obs_veh, f_drag, sigma)
+        rows, min_h, threat_vehicle = self._rows(xs, obs, obs_veh, f_drag, sigma, a_h)
         self._last_min_h = min_h
 
         # Input box: steering rate and the soil's cornering authority, pedal rate.
@@ -472,6 +513,7 @@ class TheoryCBFSafetyFilter:
                 "variant": self.variant,
                 "soil": self._soil,
                 "a_brake_margined": self._a_h,
+                "a_brake_used": self._a_h_used,
                 "a_lat_max": self._a_lat,
                 "d_hat": self._d_hat,
                 "infeasible": self._infeasible_count,

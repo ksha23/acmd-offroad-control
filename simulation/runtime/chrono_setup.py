@@ -204,7 +204,8 @@ def load_terrain_config(config_path):
 def setup_scm_terrain(system, vehicle=None, visualize=True, terrain_preset='sand',
                       terrain_config=None, mesh_resolution=None,
                       bumpiness=0, bump_seed=12345, texture=True,
-                      spatial_spec=None, terrain_length=None, terrain_width=None):
+                      spatial_spec=None, terrain_length=None, terrain_width=None,
+                      grade_profile=None):
     """Setup SCM deformable terrain
 
     Args:
@@ -225,6 +226,9 @@ def setup_scm_terrain(system, vehicle=None, visualize=True, terrain_preset='sand
                    call still runs as a fallback; pass
                    terrain_preset=spatial_spec.start_preset so the base soil
                    and the callback agree on the start of the patch.
+        grade_profile: Optional GradeProfile (scenarios/grade_terrain.py), a
+                   flat approach and then a constant grade along x. Used when
+                   bumpiness is 0.
     """
     import tempfile
     
@@ -337,6 +341,16 @@ def setup_scm_terrain(system, vehicle=None, visualize=True, terrain_preset='sand
                           0.0, bump_amplitude, delta)
         print(f"  Bumpy terrain: amplitude={bump_amplitude:.2f}m, "
               f"wavelength={bump_wavelength:.0f}m, max_slope={bump_max_slope*100:.0f}%")
+    elif grade_profile is not None and grade_profile.grade != 0.0:
+        heightmap_tmp = tempfile.NamedTemporaryFile(
+            prefix="scm_grade_", suffix=".png", delete=False
+        )
+        heightmap_file = heightmap_tmp.name
+        heightmap_tmp.close()
+        h_min, h_max = grade_profile.write_png(heightmap_file, length, width)
+        terrain.Initialize(heightmap_file, length, width, h_min, h_max, delta)
+        print(f"  Grade terrain: {grade_profile.grade * 100:+.0f}% from x = "
+              f"{grade_profile.start_x:.1f} m, heights {h_min:.2f} to {h_max:.2f} m")
     else:
         terrain.Initialize(length, width, delta)
     

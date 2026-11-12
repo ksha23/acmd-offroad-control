@@ -914,11 +914,15 @@ def run_sim_node(args):
         else:
             base_preset = start_preset
 
+    grade_profile = None
+    if args.terrain_grade != 0.0:
+        from grade_terrain import GradeProfile
+        grade_profile = GradeProfile(args.terrain_grade, args.terrain_grade_start_x)
     terrain, terrain_params = setup_scm_terrain(
         system, vehicle=vehicle, visualize=any_vis,
         terrain_preset=base_preset, terrain_config=terrain_config,
         bumpiness=args.bumpiness, spatial_spec=spatial_spec,
-        mesh_resolution=args.mesh_resolution,
+        mesh_resolution=args.mesh_resolution, grade_profile=grade_profile,
     )
 
     if any_vis:
@@ -942,6 +946,7 @@ def run_sim_node(args):
             min_spacing=args.rock_min_spacing,
             centerline_clear=args.rock_centerline_clear,
             exclusion_zones=exclusion_zones,
+            ground_height=grade_profile.height if grade_profile is not None else None,
         )
         print(f"  Placed {len(rocks)} rock obstacles")
         # Dump static obstacle geometry next to the diagnostic trace so the
@@ -971,6 +976,9 @@ def run_sim_node(args):
     # arms of a cell see the same errors.
     traffic_noise_rng = np.random.default_rng(
         [args.sim_seed if args.sim_seed is not None else 0, 7531])
+    # Height error of the lidar-like grade preview, from its own stream.
+    grade_noise_rng = np.random.default_rng(
+        [args.sim_seed if args.sim_seed is not None else 0, 9091])
 
     # --- Goal gate (visible finish line; round ends early on reaching it) ---
     if args.goal_distance > 0 and any_vis:
@@ -1594,6 +1602,7 @@ def run_sim_node(args):
     step_count = 0
     sim_diag_file = None
     sim_diag_writer = None
+    _grade_log = None
     sim_diag_interval = 0.1
     last_sim_diag_time = -sim_diag_interval
     if args.sim_diag_csv:
@@ -1813,6 +1822,26 @@ def run_sim_node(args):
                 'v': vel_loc.y, 'omega': chassis_body.GetAngVelLocal().z,
                 'delta': driver_inputs.m_steering * 0.49,
             }
+            if args.filter_grade_preview == "imu":
+                # sin of the nose-down pitch of the chassis, now.
+                veh_state['grade_now'] = -float(veh_rot.Rotate(chrono.ChVector3d(1, 0, 0)).z)
+            elif args.filter_grade_preview in ("map", "lidar"):
+                # Ground heights every 0.5 m along the heading out to 40 m.
+                _ds = 0.5
+                _s = np.arange(0.0, 40.0 + 1e-9, _ds)
+                _c, _sn = np.cos(veh_psi), np.sin(veh_psi)
+                _h = np.array([
+                    terrain.GetHeight(chrono.ChVector3d(veh_pos.x + d * _c, veh_pos.y + d * _sn, 0.0))
+                    for d in _s])
+                if args.filter_grade_preview == "lidar":
+                    # As a roof lidar 2.1 m above the ground sees them: a cell
+                    # hidden behind nearer ground (a crest) is unknown (nan),
+                    # and a seen one has a height error that grows with range.
+                    _los = (_h[1:] - (_h[0] + 2.1)) / _s[1:]
+                    _seen = np.concatenate([[True], _los >= np.maximum.accumulate(_los) - 1e-9])
+                    _h = _h + grade_noise_rng.normal(0.0, 1.0, _h.shape) * (0.02 + 0.002 * _s)
+                    _h[~_seen] = np.nan
+                veh_state['terrain_ahead'] = (_ds, _h)
             sf_result = safety_filter.filter(
                 desired_steering=driver_inputs.m_steering,
                 desired_throttle=driver_inputs.m_throttle,
@@ -1823,6 +1852,15 @@ def run_sim_node(args):
             driver_inputs.m_steering = sf_result.steering
             driver_inputs.m_throttle = sf_result.throttle
             driver_inputs.m_braking = sf_result.braking
+            if grade_profile is not None and args.sim_diag_csv:
+                # The stopping deceleration the filter assumed at each call, for
+                # the terrain-preview study.
+                if _grade_log is None:
+                    _grade_log = open(Path(args.sim_diag_csv).with_name("grade_preview.csv"), "w", buffering=1)
+                    _grade_log.write("time,x,z,speed,a_brake_used\n")
+                _grade_log.write(f"{time_chrono:.3f},{veh_pos.x:.3f},{veh_pos.z:.3f},"
+                                 f"{veh_state['u']:.3f},"
+                                 f"{float(getattr(safety_filter, '_a_h_used', float('nan'))):.4f}\n")
         elif safety_filter is not None and safety_filter._last_result is not None:
             cached = safety_filter._last_result
             if cached.was_modified:
@@ -2374,6 +2412,13 @@ def main():
     p.add_argument("--terrain-config", type=str, default=None, help="YAML terrain config")
     p.add_argument("--bumpiness", type=int, default=0, choices=range(0, 11),
                     help="Terrain bumpiness level 0 (flat) to 10 (extreme)")
+    p.add_argument("--terrain-grade", type=float, default=0.0,
+                   help="Flat up to --terrain-grade-start-x, then a constant grade "
+                        "along +x (rise over run, negative downhill). Rocks sit on "
+                        "the slope. 0 (default) keeps the flat patch. Needs "
+                        "--bumpiness 0.")
+    p.add_argument("--terrain-grade-start-x", type=float, default=30.0,
+                   help="Where the grade of --terrain-grade starts (m along x).")
 
     # Spatial soil transition: soil changes type partway across the patch via a
     # per-location SCM callback (vehicle drives +x through the boundary).
@@ -2616,7 +2661,7 @@ def main():
                         "error bound. 0 (default) gives the filter the true speed.")
     p.add_argument("--cbf-theory", action="store_true",
                    help="DOB-CBF only: the textbook DOB-CBF (simulation/safety/"
-                        "dob_cbf_theory.py): high-order CBF on the ellipse with real "
+                        "dob_cbf_theory.py): high-order CBF on the distance with real "
                         "roots, braking-distance and sensing-edge barriers on the "
                         "surrogate's soil braking, a disturbance observer whose error "
                         "bound tightens every row, hard constraints, full braking with "
@@ -2636,6 +2681,17 @@ def main():
     p.add_argument("--filter-sense-range", type=float, default=30.0,
                    help="Centre distance (m) within which the safety filter is "
                         "given obstacles. The published runs used 30 m.")
+    p.add_argument("--filter-grade-preview", type=str, default="none",
+                   choices=["none", "imu", "map", "lidar"],
+                   help="Textbook DOB-CBF only: what its braking barriers know of "
+                        "the grade. none (default): flat ground. imu: the chassis "
+                        "pitch now, held over the whole stop. map: terrain heights "
+                        "along the heading out to 40 m, read from SCM (an oracle "
+                        "elevation map), and the steepest downgrade over the stop. "
+                        "lidar: the same heights as a roof lidar 2.1 m up sees "
+                        "them, ground hidden behind a crest unknown and a height "
+                        "error of 0.02 m + 0.2 percent of range; the filter takes "
+                        "unknown ground as its steepest admissible downgrade.")
     p.add_argument("--safety-sim-clock", action="store_true",
                    help="Run the safety filter's command-age smoother, stale-command "
                         "brake and steering lag on simulation time instead of wall "

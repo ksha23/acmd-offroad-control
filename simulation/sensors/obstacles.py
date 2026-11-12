@@ -44,7 +44,8 @@ def add_rock_obstacles(system: 'chrono.ChSystem',
                        min_spacing: float = 0.0,
                        centerline_clear: float = 0.0,
                        centerline_keep_prob: float = 0.35,
-                       exclusion_zones: List[Tuple[float, float, float]] = None) -> List[dict]:
+                       exclusion_zones: List[Tuple[float, float, float]] = None,
+                       ground_height=None) -> List[dict]:
     """
     Add randomized rock obstacles to the Chrono system.
 
@@ -79,6 +80,8 @@ def add_rock_obstacles(system: 'chrono.ChSystem',
         centerline_keep_prob: Keep-probability for rocks inside centerline_clear.
         exclusion_zones: List of (center_x, center_y, radius) tuples.
                         No rocks are placed within these circles.
+        ground_height: Optional callable (x, y) -> ground height, so rocks sit
+                        on a sloped patch. Flat ground at 0 when not given.
 
     Returns:
         List of dicts with rock metadata:
@@ -144,8 +147,9 @@ def add_rock_obstacles(system: 'chrono.ChSystem',
         size = rng.uniform(size_range[0], size_range[1])
         yaw = rng.uniform(0, 2 * np.pi)
         
-        # Vertical position: partially buried
-        z = size * bury_fraction
+        # Vertical position: partially buried, on the ground under the rock
+        # (ground_height(x, y), flat at 0 when not given).
+        z = size * bury_fraction + (float(ground_height(x, y)) if ground_height else 0.0)
         
         # Create rock body (fixed, no dynamics)
         rock_body = chrono.ChBody()
