@@ -186,7 +186,7 @@ class SurrogateBicycle:
         fy = fy.reshape(4, b)
         return -(fy[0] + fy[1]), -(fy[2] + fy[3])
 
-    def deriv(self, x, delta, pedal, accel_gain, brake_margin):
+    def deriv(self, x, delta, pedal, accel_gain, brake_margin, g_along=0.0):
         """State derivative for a batch x of shape (B, 7), [X, Y, psi, u, v, r, a].
 
         ``a`` is the applied longitudinal acceleration. It follows the pedal's
@@ -194,6 +194,10 @@ class SurrogateBicycle:
         plant's pedal rate limit and its brake force build-up while the wheels
         spin down (model_check.py). The slip ratio, and with it the cornering
         force braking leaves, follows the pedal directly.
+
+        ``g_along`` is gravity along the heading (m/s^2, positive downhill). It
+        adds to ``a``, and a net deceleration fades out at a standstill, so the
+        vehicle stays stopped on a slope its brakes can hold.
         """
         X, Y, psi, u, v, r, a = x.T
         a_tgt, k_f, k_r = self.longitudinal(pedal, accel_gain, brake_margin)
@@ -205,14 +209,15 @@ class SurrogateBicycle:
         r_dot = (w * (self.Lf * fyf - self.Lr * fyr) / self.Izz
                  + (1.0 - w) * (r_kin - r) / self.tau_kin)
         c, s = np.cos(psi), np.sin(psi)
-        u_dot = np.where(a < 0.0, a * np.tanh(np.maximum(u, 0.0) / BRAKE_FADE_SPEED), a)
+        net = a + g_along
+        u_dot = np.where(net < 0.0, net * np.tanh(np.maximum(u, 0.0) / BRAKE_FADE_SPEED), net)
         return np.stack([u * c - v * s, u * s + v * c, r, u_dot, v_dot, r_dot,
                          (a_tgt - a) / self.tau_long], axis=1)
 
-    def step(self, x, delta, pedal, h, accel_gain, brake_margin):
+    def step(self, x, delta, pedal, h, accel_gain, brake_margin, g_along=0.0):
         """One midpoint (RK2) step for a batch. Speed is held at zero or above."""
-        k1 = self.deriv(x, delta, pedal, accel_gain, brake_margin)
-        k2 = self.deriv(x + 0.5 * h * k1, delta, pedal, accel_gain, brake_margin)
+        k1 = self.deriv(x, delta, pedal, accel_gain, brake_margin, g_along)
+        k2 = self.deriv(x + 0.5 * h * k1, delta, pedal, accel_gain, brake_margin, g_along)
         xn = x + h * k2
         stopped = xn[:, 3] <= 0.0
         if np.any(stopped):
@@ -221,12 +226,12 @@ class SurrogateBicycle:
             xn[stopped, 5] = 0.0
         return xn
 
-    def step_rk4(self, x, delta, pedal, h, accel_gain, brake_margin):
+    def step_rk4(self, x, delta, pedal, h, accel_gain, brake_margin, g_along=0.0):
         """One classic RK4 step for a batch, the scheme of the OCP's integrator."""
-        k1 = self.deriv(x, delta, pedal, accel_gain, brake_margin)
-        k2 = self.deriv(x + 0.5 * h * k1, delta, pedal, accel_gain, brake_margin)
-        k3 = self.deriv(x + 0.5 * h * k2, delta, pedal, accel_gain, brake_margin)
-        k4 = self.deriv(x + h * k3, delta, pedal, accel_gain, brake_margin)
+        k1 = self.deriv(x, delta, pedal, accel_gain, brake_margin, g_along)
+        k2 = self.deriv(x + 0.5 * h * k1, delta, pedal, accel_gain, brake_margin, g_along)
+        k3 = self.deriv(x + 0.5 * h * k2, delta, pedal, accel_gain, brake_margin, g_along)
+        k4 = self.deriv(x + h * k3, delta, pedal, accel_gain, brake_margin, g_along)
         xn = x + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         stopped = xn[:, 3] <= 0.0
         if np.any(stopped):
@@ -235,23 +240,28 @@ class SurrogateBicycle:
             xn[stopped, 5] = 0.0
         return xn
 
-    def rollout_rk4(self, x0, cmds, hs, h_tail, accel_gain, brake_margin, t_tail, stop_speed=0.05):
+    def rollout_rk4(self, x0, cmds, hs, h_tail, accel_gain, brake_margin, t_tail, stop_speed=0.05,
+                    gravity=None):
         """Roll one command sequence out with RK4: ``cmds`` (K, 2) held for the
         step lengths ``hs`` (K,), then the last command with steps ``h_tail``
-        for up to ``t_tail`` seconds or until the vehicle stops. Returns the
-        states (n+1, 7)."""
+        for up to ``t_tail`` seconds or until the vehicle stops. ``gravity(X, Y)``
+        gives gravity along the heading at the start of each step (none: flat).
+        Returns the states (n+1, 7)."""
         x = np.asarray(x0, dtype=float)[None, :].copy()
         xs = [x[0].copy()]
+
+        def g(x):
+            return gravity(float(x[0, 0]), float(x[0, 1])) if gravity is not None else 0.0
         for c, h in zip(cmds, hs):
             x = self.step_rk4(x, np.array([c[0] * self.max_steer]), np.array([c[1]]), float(h),
-                              accel_gain, brake_margin)
+                              accel_gain, brake_margin, g(x))
             xs.append(x[0].copy())
         c = cmds[-1]
         for _ in range(int(np.ceil(t_tail / h_tail))):
             if x[0, 3] <= stop_speed:
                 break
             x = self.step_rk4(x, np.array([c[0] * self.max_steer]), np.array([c[1]]), h_tail,
-                              accel_gain, brake_margin)
+                              accel_gain, brake_margin, g(x))
             xs.append(x[0].copy())
         return np.array(xs)
 
@@ -308,10 +318,11 @@ class SurrogateBicycle:
         return (ca.if_else(braking, ax_brake, ax_drive), ca.if_else(braking, k_bf, k_d),
                 ca.if_else(braking, k_br, k_d))
 
-    def f_expl_sym(self, x, delta, pedal, terrain_sym, curve_sym, accel_gain, brake_margin):
+    def f_expl_sym(self, x, delta, pedal, terrain_sym, curve_sym, accel_gain, brake_margin, g_along=0.0):
         """Symbolic state derivative of the 7-state model. ``terrain_sym`` is
-        [Kphi, Kc, n, c, phi, k] in the surrogate's feature convention and
-        ``curve_sym`` the per-wheel longitudinal force knots (``self.curve``)."""
+        [Kphi, Kc, n, c, phi, k] in the surrogate's feature convention,
+        ``curve_sym`` the per-wheel longitudinal force knots (``self.curve``) and
+        ``g_along`` gravity along the heading, as in ``deriv``."""
         X, Y, psi, u, v, r, a = x[0], x[1], x[2], x[3], x[4], x[5], x[6]
         a_tgt, k_f, k_r = self.longitudinal_sym(pedal, curve_sym, accel_gain, brake_margin)
         u_s = ca.fmax(ca.fabs(u), 0.5)
@@ -344,7 +355,8 @@ class SurrogateBicycle:
         v_kin = r_kin * self.Lr
         v_dot = w * ((fyf + fyr) / M - u * r) + (1.0 - w) * (v_kin - v) / self.tau_kin
         r_dot = w * (self.Lf * fyf - self.Lr * fyr) / self.Izz + (1.0 - w) * (r_kin - r) / self.tau_kin
-        u_dot = ca.if_else(a < 0.0, a * ca.tanh(ca.fmax(u, 0.0) / BRAKE_FADE_SPEED), a)
+        net = a + g_along
+        u_dot = ca.if_else(net < 0.0, net * ca.tanh(ca.fmax(u, 0.0) / BRAKE_FADE_SPEED), net)
         return ca.vertcat(u * ca.cos(psi) - v * ca.sin(psi),
                           u * ca.sin(psi) + v * ca.cos(psi),
                           r, u_dot, v_dot, r_dot, (a_tgt - a) / self.tau_long)

@@ -48,6 +48,7 @@ import casadi as ca
 
 from . import SafetyFilterResult
 from .authority import peak_braking_decel, peak_lateral_accel
+from .grade_preview import G, gravity_lookup, unknown_sine
 
 _ACADOS_BUILD_ROOT = Path(
     os.environ.get("MPSF_BUILD_ROOT",
@@ -120,6 +121,7 @@ class MPSFSafetyFilter:
                  psf_globalization: str = "FIXED_STEP",
                  traffic_speed_err: float = 0.0,
                  traffic_accel: float = 1.0,
+                 unknown_downgrade: float = 0.15,
                  build_solver: bool = True,
                  **_ignored):
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
@@ -167,6 +169,9 @@ class MPSFSafetyFilter:
         # footprint disc must clear that whole segment.
         self.traffic_speed_err = float(traffic_speed_err)
         self.traffic_accel = float(traffic_accel)
+        # Grade preview (dynamic model): ground the preview has not seen counts
+        # as this downgrade (rise over run).
+        self.unknown_downgrade = float(unknown_downgrade)
         # Terminal set by construction: after the planned stages the OCP carries
         # a tail of stages whose input is fixed to the backup, straight full
         # braking, and the last state must be stopped. The terminal set is then
@@ -263,10 +268,11 @@ class MPSFSafetyFilter:
             # + [sense centre x, y, effective sensed radius, terminal braking decel]
             self._np += 4
         if self.dynamic_model:
-            # + the soil in the surrogate's feature convention and the per-wheel
-            # longitudinal force curve the braking torque balance reads.
+            # + the soil in the surrogate's feature convention, the per-wheel
+            # longitudinal force curve the braking torque balance reads, and
+            # gravity along the heading at the stage (0 on flat ground).
             from .surrogate_dynamics import N_CURVE
-            self._np += 6 + N_CURVE
+            self._np += 6 + N_CURVE + 1
         self._bike = None
         self._dyn_soil = None
         self._ax_app = 0.0          # applied longitudinal acceleration (model state)
@@ -519,7 +525,7 @@ class MPSFSafetyFilter:
         if self.dynamic_model:
             from . import surrogate_dynamics as sd
             b = self._bike
-            cfg = cfg + ("psf_dynamic_v7_segments", self.psf_cost, self.psf_lm, self.psf_w_rest, self.psf_rk_steps, self.psf_max_iter,
+            cfg = cfg + ("psf_dynamic_v8_grade", self.psf_cost, self.psf_lm, self.psf_w_rest, self.psf_rk_steps, self.psf_max_iter,
                          self.psf_globalization, self.time_steps, self._tail_steps, self.stop_speed,
                          self.disc_offsets,
                          self.disc_radius, self.ocp_margin, self.tube_c1, self.tube_eps,
@@ -554,8 +560,9 @@ class MPSFSafetyFilter:
         cx, cy, r_eff, a_term = p[q], p[q + 1], p[q + 2], p[q + 3]
         terrain = p[q + 4:q + 10]
         curve = p[q + 10:q + 10 + N_CURVE]
+        g_along = p[q + 10 + N_CURVE]
         f_vehicle = self._bike.f_expl_sym(x[0:7], st * self.max_steer, al, terrain, curve,
-                                          p[2] * self.max_accel, self.brake_margin)
+                                          p[2] * self.max_accel, self.brake_margin, g_along)
         eps_r = 0.01  # smooths |r|
         f_expl = ca.vertcat(f_vehicle, uu, ca.sqrt(r ** 2 + eps_r ** 2) - eps_r, uu * turned)
         model = AcadosModel()
@@ -1092,15 +1099,19 @@ class MPSFSafetyFilter:
         d_hi = v_hi * t + 0.5 * self.traffic_accel * t * t
         return ox + d_lo * hx, oy + d_lo * hy, ox + d_hi * hx, oy + d_hi * hy
 
-    def _check(self, z0, plan, obstacles):
+    def _check(self, z0, plan, obstacles, gravity=None):
         """Roll the plan out on the model with the OCP's own integrator, then
         straight full braking to a stop, and test every constraint of the OCP
-        without slack against the whole obstacle field."""
+        without slack against the whole obstacle field. ``gravity(X, Y)`` is
+        gravity along the heading where the vehicle is (none: flat ground)."""
         cmds, hs = self._substep_inputs(plan)
         a_min = max(self.brake_margin * self._bike.peak_decel(), 0.5)
+        if gravity is not None:
+            # A downhill stretches the stop: allow for the steepest admissible grade.
+            a_min = max(a_min - G * unknown_sine(self.unknown_downgrade), 0.3)
         xs = self._bike.rollout_rk4(z0, cmds, hs, self.cert_dt,
                                     self._accel_grip * self.max_accel, self.brake_margin,
-                                    float(z0[3]) / a_min + 3.0)
+                                    float(z0[3]) / a_min + 3.0, gravity=gravity)
         n_extra = len(xs) - 1 - len(hs)
         t = np.concatenate([np.cumsum(hs), hs.sum() + self.cert_dt * np.arange(1, n_extra + 1)])
         P, psi = xs[:, :2], xs[:, 2]
@@ -1135,11 +1146,12 @@ class MPSFSafetyFilter:
                 hs.append(dt_k / self.psf_rk_steps)
         return np.array(cmds), np.array(hs)
 
-    def _warm_start(self, z0, plan):
+    def _warm_start(self, z0, plan, gravity=None):
         """OCP node states from rolling the plan and the tail out on the model."""
         cmds, hs = self._substep_inputs(plan)
         xs = self._bike.rollout_rk4(z0[:7], cmds, hs, self.cert_dt,
-                                    self._accel_grip * self.max_accel, self.brake_margin, 0.0)
+                                    self._accel_grip * self.max_accel, self.brake_margin, 0.0,
+                                    gravity=gravity)
         P = xs[:, :2]
         seg = np.concatenate([[0.0], np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1]))])
         turned = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(np.unwrap(xs[:, 2]))))])
@@ -1182,15 +1194,20 @@ class MPSFSafetyFilter:
         t_nodes = np.concatenate([[0.0], np.cumsum(steps)])
         # Each obstacle's segment at every node, as columns (ax, ay, bx, by).
         segs = [np.stack(self._segment(o, t_nodes), axis=1) for o in obs]
+        # Gravity along the heading from the grade preview, if the simulator
+        # gives one. The OCP takes it at each node's warm-start position, the
+        # check at every position of the rolled-out plan.
+        gravity = gravity_lookup(vehicle_state, self._bike.L, self.unknown_downgrade)
+        guess = (list(self._sol[1:]) + [self._sol[-1]] if self._sol is not None
+                 else [(s_op, a_op)] * self.N)
+        xw = self._warm_start(z0, guess, gravity)
 
         def stage_p(k):
             o_k = [c for o, sg in zip(obs, segs) for c in (*sg[k], float(o[2]))]
             head = [s_op, a_op] if k < self.N else [0.0, -1.0]   # the tail's input is fixed
+            g_k = gravity(float(xw[k][0]), float(xw[k][1])) if gravity is not None else 0.0
             return np.array(head + [self._accel_grip, self._brake_grip, self._lat_accel_max]
-                            + o_k + tail, dtype=float)
-        guess = (list(self._sol[1:]) + [self._sol[-1]] if self._sol is not None
-                 else [(s_op, a_op)] * self.N)
-        xw = self._warm_start(z0, guess)
+                            + o_k + tail + [g_k], dtype=float)
         brake = np.array([0.0, -1.0])
         plan = None
         sv = self._solver
@@ -1217,7 +1234,7 @@ class MPSFSafetyFilter:
 
         # The solver's iterate warm-starts the next call either way.
         self._sol = plan
-        if plan is not None and self._check(z0, plan, obstacles):
+        if plan is not None and self._check(z0, plan, obstacles, gravity):
             self._verified_count += 1
             self._backup = list(plan[1:])
             s_c, a_c = plan[0]

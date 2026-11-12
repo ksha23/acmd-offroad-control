@@ -47,17 +47,31 @@ def test_numpy_and_casadi_models_agree(clay_bike):
     delta = ca.SX.sym("d")
     terrain = ca.SX.sym("t", 6)
     curve = ca.SX.sym("c", N_CURVE)
-    f = ca.Function("f", [x, delta, pedal, terrain, curve],
-                    [b.f_expl_sym(x, delta, pedal, terrain, curve, 2.0, 0.85)])
+    grav = ca.SX.sym("g")
+    f = ca.Function("f", [x, delta, pedal, terrain, curve, grav],
+                    [b.f_expl_sym(x, delta, pedal, terrain, curve, 2.0, 0.85, grav)])
     rng = np.random.default_rng(0)
     for _ in range(25):
         z = np.array([1.0, -2.0, 0.3, rng.uniform(2.0, 10.0), rng.uniform(-0.5, 0.5),
                       rng.uniform(-0.4, 0.4), rng.uniform(-2.0, 1.0)])
         p = float(rng.uniform(-1.0, 1.0))
         d = float(rng.uniform(-0.45, 0.45))
-        xdot_n = b.deriv(z[None, :], np.array([d]), np.array([p]), 2.0, 0.85)[0]
-        xdot_s = np.array(f(z, d, p, b.terrain_vec, b.curve)).ravel()
+        g = float(rng.uniform(-1.5, 1.5))
+        xdot_n = b.deriv(z[None, :], np.array([d]), np.array([p]), 2.0, 0.85, g)[0]
+        xdot_s = np.array(f(z, d, p, b.terrain_vec, b.curve, g)).ravel()
         assert np.allclose(xdot_s, xdot_n, rtol=1e-6, atol=1e-6)
+
+
+def test_brakes_hold_on_a_slope_they_can_hold(clay_bike):
+    # Stopped, brakes full on, a 15% downhill: clay brakes (about 2.4 m/s^2)
+    # beat gravity along the slope (1.45 m/s^2), so the vehicle stays put.
+    z = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0]])
+    xdot = clay_bike.deriv(z, np.zeros(1), np.full(1, -1.0), 2.0, 0.85, 1.45)
+    assert xdot[0, 3] == pytest.approx(0.0, abs=1e-9)
+    # Coasting on the same slope, it rolls away.
+    z[0, 6] = 0.0
+    xdot = clay_bike.deriv(z, np.zeros(1), np.zeros(1), 2.0, 0.85, 1.45)
+    assert xdot[0, 3] == pytest.approx(1.45)
 
 
 def test_clay_brakes_lock_above_a_light_pedal(clay_bike):
@@ -109,7 +123,7 @@ def test_plans_from_the_measured_state_under_delay(clay_filter):
     # state it plans and checks from.
     seen = []
     check = clay_filter._check
-    clay_filter._check = lambda z0, plan, obs: seen.append(z0.copy()) or check(z0, plan, obs)
+    clay_filter._check = lambda z0, plan, obs, *rest: seen.append(z0.copy()) or check(z0, plan, obs, *rest)
     try:
         clay_filter.set_teleop_delay(0.3)
         clay_filter.filter(0.0, 0.4, 0.0, _state(0.0, 6.0), [])
@@ -161,3 +175,22 @@ def test_check_predicts_lead_braking():
     lead = [(14.0, 0.0, 1.2, True, 6.0, 0.0, 0.0)]
     assert not f._check(z0, [(0.0, 0.0)] * f.N, lead)
     assert f._check(z0, [(0.0, -1.0)] * f.N, lead)
+
+
+def test_check_knows_a_downhill_stop_is_longer():
+    # Clay, 6 m/s, a wall 13 m ahead, braking at once: clear on flat ground, not
+    # on a 15% downhill, where gravity takes 1.45 of the 2.4 m/s^2 of braking.
+    try:
+        f = MPSFSafetyFilter(vehicle_params=VP, dynamic_model=True, nn_model_dir=MODEL_DIR,
+                             sense_range=0, build_solver=False)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"surrogate unavailable: {e}")
+    from simulation.safety.grade_preview import gravity_lookup
+    f.update_terrain(_soil("clay"), use_terrain_nn=True)
+    f._last_sense = (0.0, 0.0, 1.0e4, 2.0)
+    z0 = np.array([0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0])
+    wall = [(13.0, float(y), 0.6) for y in np.arange(-6.0, 6.1, 1.2)]
+    brake = [(0.0, -1.0)] * f.N
+    assert f._check(z0, brake, wall)
+    downhill = gravity_lookup({"x": 0.0, "y": 0.0, "psi": 0.0, "grade_now": 0.148}, f._bike.L, 0.15)
+    assert not f._check(z0, brake, wall, downhill)

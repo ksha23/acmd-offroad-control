@@ -2683,7 +2683,7 @@ def main():
                         "given obstacles. The published runs used 30 m.")
     p.add_argument("--filter-grade-preview", type=str, default="none",
                    choices=["none", "imu", "map", "lidar"],
-                   help="Textbook DOB-CBF only: what its braking barriers know of "
+                   help="Textbook DOB-CBF and dynamic MPSF: what the filter knows of "
                         "the grade. none (default): flat ground. imu: the chassis "
                         "pitch now, held over the whole stop. map: terrain heights "
                         "along the heading out to 40 m, read from SCM (an oracle "

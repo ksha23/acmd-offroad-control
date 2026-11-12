@@ -66,6 +66,7 @@ import numpy as np
 
 from .authority import peak_lateral_accel
 from .dob_cbf import SafetyFilterResult
+from .grade_preview import G, downgrades
 from .surrogate_dynamics import SurrogateBicycle
 
 
@@ -301,31 +302,24 @@ class TheoryCBFSafetyFilter:
 
     def _braking_decel(self, vehicle_state, v):
         """Margined stopping deceleration on the grade ahead (m/s^2), see the module docstring."""
-        g = 9.81
-        if vehicle_state.get("terrain_ahead") is not None:
-            ds, h = vehicle_state["terrain_ahead"]
-            h = np.asarray(h, dtype=float)
-            k = max(1, int(round(self.L / ds)))
-            if len(h) <= k:
-                return self._a_h
-            down = (h[:-k] - h[k:]) / (k * ds)       # tan of the downgrade over one wheelbase
-            # Ground the map has not seen takes the steepest admissible downgrade.
-            down = np.where(np.isnan(down), self.unknown_downgrade, down)
-            a = self._a_h
-            # The stop's length depends on the deceleration and the deceleration
-            # on the grade over the stop: iterate from the flat value.
-            for _ in range(4):
-                stop = self.tau_b * v + v * v / (2.0 * a) + self.L
-                n = min(len(down), int(np.ceil(stop / ds)) + 1)
-                t_down = float(np.max(down[:n]))
-                s_down = float(np.clip(t_down / np.sqrt(1.0 + t_down * t_down), -0.5, 0.5))
-                c_th = np.sqrt(1.0 - s_down * s_down)
-                a = max(self._a_h * c_th - g * s_down, 0.2)
-            return a
-        if vehicle_state.get("grade_now") is not None:
-            s_down = float(np.clip(vehicle_state["grade_now"], -0.5, 0.5))
-            return max(self._a_h * np.sqrt(1.0 - s_down * s_down) - g * s_down, 0.2)
-        return self._a_h
+        prof = downgrades(vehicle_state, self.L, self.unknown_downgrade)
+        if prof is None:
+            return self._a_h
+        ds, down = prof
+        if ds is None:
+            return self._decel_on(down)
+        # The stop's length depends on the deceleration and the deceleration on
+        # the grade over the stop: iterate from the flat value.
+        a = self._a_h
+        for _ in range(4):
+            stop = self.tau_b * v + v * v / (2.0 * a) + self.L
+            n = min(len(down), int(np.ceil(stop / ds)) + 1)
+            a = self._decel_on(float(np.max(down[:n])))
+        return a
+
+    def _decel_on(self, s_down):
+        """a_h cos(theta) - g sin(theta) on a downgrade with sine s_down, floored at 0.2 m/s^2."""
+        return max(self._a_h * np.sqrt(1.0 - s_down * s_down) - G * s_down, 0.2)
 
     def _rows(self, xs, obstacles, obs_vehicle, f_drag, sigma, a_h):
         """Barrier rows c_delta u_delta + c_a u_a <= b, and the nearest threat."""
