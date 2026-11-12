@@ -335,7 +335,7 @@ choices are the design parameters the theory leaves open.
 
 | Number | Source |
 |---|---|
-| Footprint: three discs, centres -1.74, -0.18, 1.38 m, radius 1.50 m | Three equal strips of the collision mesh's outline (`hmmwv_chassis_col.obj`, 4.67 x 2.56 m), from the chassis centre of mass |
+| Footprint: the rectangle x in [-2.52, 2.16] m, y in [-1.28, 1.28] m about the centre of mass (`footprint.py`) | The collision mesh's outline (`hmmwv_chassis_col.obj`, 4.67 x 2.56 m). The chassis centre of mass sits 0.056 m ahead of the mesh origin. |
 | Steering 16 per s of full lock, pedal 8 per s, 0.49 rad at full lock | The plant node's actuator limits |
 | 4000 N m per wheel at full brake, tyre radius 0.467 m | HMMWV_BrakeSimple / BrakeShafts, HMMWV_RigidTire |
 | Drive torque at the wheels | The plant's powertrain, quasi-static: `shafts` (engine torque and loss maps, torque converter, gears 0.2/0.4/0.8, up-shift at 2500 rpm of the turbine), `simple_map` (330 N m, 110 kW, six gears) or `simple_cvt`. The simulator reads which one it built. |
@@ -347,32 +347,40 @@ torque / radius until the curve's end (the locked-wheel force braking, the top
 of the drive curve driving). Braking has no margin. The applied pedal is a
 state moved at its rate limit, and acceleration follows from it at once.
 
-**Identified** (`ident/plant_bounds_chrono9.json`, per powertrain, over the three
-soils). From plant manoeuvres shaped like a certificate: a manoeuvre for 1 or
-2 s, then straight full braking to a stop (`benchmarking/safety_ident/`). Half
-the runs, drawn by a fixed seed within each powertrain, soil and manoeuvre
-family, identify. The rest check. Each bound is the tightest of its form that
-covers every identification point (a linear program).
+**Identified** (`ident/plant_bounds_chrono9_box.json`, per powertrain, over the
+three soils). From plant manoeuvres shaped like a certificate: a manoeuvre for 1
+or 2 s from a cruise of 3 to 11 m/s or from rest, then straight full braking to a
+stop (`benchmarking/safety_ident/`). Half the runs, drawn by a fixed seed within
+each powertrain, soil and manoeuvre family, identify. The rest check. Each bound
+is the tightest of its form that covers every identification point (a linear
+program), measured on the rectangle's four corners.
 
 | Bound | Full powertrain | Simple powertrain | Held out |
 |---|---|---|---|
-| MPSF tube, c0 + c1 s + eps S | 0.53 + 0.084 s + 0.030 S | 0.47 + 0.057 s + 0.050 S | full: 0 of 4,574 points outside. Simple: 30 of 4,416, worst by 0.16 m |
-| Backup stop, S_plant <= s0 + s1 S_model | 0.57 + 1.12 S_model | 0.23 + 1.10 S_model | full: 0 of 133 runs. Simple: 1 of 130, by 2 cm |
-| Off the braking line, <= l0 + l1 S_model | 0.27 + 0.040 S_model | 0.33 + 0.028 S_model | full: 3 of 133. Simple: 0 of 130 |
-| Observer error (m/s^2) | 6.7 | 5.0 | full: 1 of 4,637 points above. Simple: 1 of 4,466 |
+| Stop: front edge past its start <= s0 + s1 S_model | 0.59 + 1.14 S_model | 0.56 + 1.08 S_model | full: 2 of 198 runs above. Simple: 9 of 212, worst by 0.16 m |
+| Drift: corners past the sides <= l0 + l1 S_model | 0.71 + 0.073 S_model | 0.65 + 0.063 S_model | full: 0 of 198. Simple: 1 of 212 |
+| MPSF tube (sideways), c0 + c1 s + eps S | 0.57 + 0.030 s + 0.35 S | 0.93 + 0.030 s + 0.17 S | full: 8 of 6,883 points outside, worst by 0.14 m. Simple: 14 of 7,772, worst by 0.27 m |
+| Observer error (m/s^2) | 6.7 | 5.0 | full: 1 of 6,977 points above. Simple: 1 of 7,891 |
+
+The MPSF's prediction is extended straight past its stop by the stop bound's
+overshoot of its braking part (from the final full-brake command), and the tube
+is measured against that extended prediction: for each plant pose, the largest
+corner-to-corner distance to the one predicted pose that matches it best. So the
+whole plant rectangle lies within the tube of that predicted rectangle.
 
 **Derived from those** (in the filters)
 
 * DOB-CBF barrier: distance from the obstacle's set to the backup's swept
-  footprint, less the radii and the lateral bound, first order in both inputs
-  (module docstring). A vehicle's set is what it can cover during the backup's
+  rectangle (the body lengthened by the stop bound, widened by the drift bound),
+  less the obstacle's radius, first order in both inputs (module docstring). A vehicle's set is what it can cover during the backup's
   stop, at its speed plus the measurement error and the soil's drive capability.
 * DOB-CBF sampled-data margin: 1/2 L dt^2 with L the largest |h''| over a
   period at the corners of the input box.
 * MPSF: no speed cap. The traffic acceleration bound is the soil's drive
-  capability. Each node keeps the clearance widened by the chord and sagitta to
-  the next node (ego and obstacle travel). The check rolls the backup out until
-  the model stops and rejects a plan that does not.
+  capability. Each pose keeps the clearance widened by the gap to the next one:
+  the travel of the rectangle's farthest point (2.82 m from the centre of mass)
+  and the obstacle's, and the sagitta of the arc. The check rolls the backup out
+  until the model stops and rejects a plan that does not.
 * Neither filter projects the state over the teleop delay: it runs on the vehicle.
 
 **Free design parameters** (the theory leaves them open, so they are reported
@@ -389,8 +397,13 @@ surrogate), and its spin-axis moment (which the rig records) puts the
 free-rolling slip at -0.24 on clay where the plant rolls at -0.03. The observer
 error comes from events the model does not have (wheel lock onset, gear shifts
 with their 1 s latency, starts from rest), not from a lag: a first-order lag of
-0 to 0.3 s leaves it at 4 to 7 m/s^2. Bounds for `simple_cvt` (newer Chrono)
-are not identified yet.
+0 to 0.3 s leaves it at 4 to 7 m/s^2. The largest short-range sideways errors
+come from three regimes the model gets wrong: partial braking while steering on
+clay (the model locks the wheels and barely turns, the plant turns), full-lock
+starts from rest, and partial braking on sand (the model brakes much harder).
+Bounds for `simple_cvt` (newer Chrono) are not identified yet.
+`ident/plant_bounds_chrono9.json` is the first version (three footprint discs,
+one round tube, cruise speeds up to 7 m/s).
 
 ## Tire model supervision
 

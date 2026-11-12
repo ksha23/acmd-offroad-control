@@ -169,3 +169,19 @@ def test_derived_mpsf_check_needs_the_stop(clay):
     far = stop + need + 1.0
     assert not f._check_derived(z0, brake_now, [(near, 0.0, 1.0)])
     assert f._check_derived(z0, brake_now, [(far, 0.0, 1.0)])
+
+
+def test_derived_mpsf_starts_behind_a_stalled_vehicle(clay):
+    """A stalled vehicle 16 m ahead whose measured speed jitters above zero: its set may run away from the ego,
+    which must not block a short start-and-stop."""
+    pytest.importorskip("acados_template")
+    from simulation.safety.mpsf import MPSFSafetyFilter
+    t, nn = clay
+    f = MPSFSafetyFilter(VP, dynamic_model=True, derived=True, ident=IDENT, powertrain="shafts",
+                         odd_obstacle_radius=2.2, sense_range=0.0, build_solver=False)
+    f.update_terrain(t, use_terrain_nn=True)
+    f._last_sense = (0.0, 0.0, 1.0e4, f._bike.peak_decel())
+    z0 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    plan = [(0.0, 0.75)] + [(0.0, -1.0)] * (f.N - 1)
+    car = [(16.0, 0.0, 2.2, True, 0.02, 0.0, 0.0)]
+    assert f._check_derived(z0, plan, car)

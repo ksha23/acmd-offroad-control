@@ -1368,8 +1368,9 @@ class MPSFSafetyFilter:
         pedal ramped down until the model stops, which it must. The prediction is extended straight past the stop
         by the identified overshoot of its braking part (from where the final full-brake command starts). At every
         pose, every obstacle's set must clear the rectangle by its radius plus the sideways tube, widened by the
-        gap to the next pose: the travel of the rectangle's farthest point and the obstacle's, and the sagitta of
-        the arc."""
+        gap to the next pose: the travel of the rectangle's farthest point and the sagitta of its arc. A vehicle's
+        set only moves forward along its heading, so between two poses it lies on the segment from its slow end at
+        the first to its fast end at the second, which the check uses."""
         from . import footprint as fp
         cmds, hs = self._substep_inputs(plan)
         a_min = max(self._bike.peak_decel(), 0.5)
@@ -1418,11 +1419,12 @@ class MPSFSafetyFilter:
             if n_ext:
                 _, _, bx_late, by_late = self._segment(o, np.array([t_end * max(self.stop_s1, 1.0)]))
                 bx[-n_ext:], by[-n_ext:] = bx_late[0], by_late[0]
-            far = np.hypot(np.diff(bx, append=bx[-1]), np.diff(by, append=by[-1]))
+            # The obstacle's set from this pose to the next: slow end now, fast end at the next pose.
+            bx = np.append(bx[1:], bx[-1])
+            by = np.append(by[1:], by[-1])
             radius = float(o[2]) + tube
-            travel = step + far
-            sag = travel * dpsi / 8.0
-            need = np.sqrt((radius + sag) ** 2 + (travel / 2.0) ** 2)
+            sag = step * dpsi / 8.0
+            need = np.sqrt((radius + sag) ** 2 + (step / 2.0) ** 2)
             qax, qay = fp.to_body(ax, ay, X, Y, psi)
             qbx, qby = fp.to_body(bx, by, X, Y, psi)
             if np.any(fp.segment_box(qax, qay, qbx, qby, x_r, x_f, w) < need):
