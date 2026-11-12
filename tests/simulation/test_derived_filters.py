@@ -143,6 +143,18 @@ def test_derived_cbf_brakes_for_a_wall_too_close(dob):
     assert r.was_modified and r.braking > 0.0 and r.throttle == 0.0
 
 
+def test_derived_cbf_does_not_throttle_into_a_vehicle_it_stopped_behind(dob):
+    """Standing with its front 0.6 m from a stalled vehicle: the operator's throttle would start the car before
+    the brake could ramp in, so it must not pass."""
+    from simulation.safety import footprint as fp
+    x_r, x_f, w = fp.body_box()
+    t_xr, _, _ = fp.traffic_box()
+    car_x = x_f + 0.6 - t_xr
+    state = dict(x=0.0, y=0.0, psi=0.0, u=0.0)
+    r = dob.filter(0.0, 0.6, 0.0, state, obstacles=[(car_x, 0.0, 2.2, True, 0.0, 0.0, 0.0)])
+    assert r.throttle < 0.6 and r.was_modified
+
+
 def test_derived_cbf_starts_behind_a_standing_vehicle(dob):
     state = dict(x=0.0, y=0.0, psi=0.0, u=0.0)
     car = [(16.0, 0.0, 2.2, True, 0.0, 0.0)]

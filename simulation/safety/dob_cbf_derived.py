@@ -25,12 +25,15 @@ functions, Gurriet et al. 2018, Chen et al. 2021).
 Sensing edge: the swept rectangle's far corners must stay inside the sensed range less the largest obstacle the
 scenario can hold.
 
-Condition: h' + gamma h >= 0, with h' linear in tan(delta) and the commanded pedal and the observer's error bound
-in the worst direction (Alan et al. 2023). The derivatives of h are taken by central differences.
+Condition: the discrete-time one of a filter whose input is held over its period (Agrawal and Sreenath 2017),
+h at the end of the period >= (1 - gamma dt) h now, with the observer's error bound in the worst direction (Alan et
+al. 2023). The end state comes from the model with the pedal ramped to its command at the rate limit. h is concave
+in the pedal (flat until the throttle overcomes the soil's resistance, then falling), so the two secants through
+the box's ends and the held pedal, as two rows, lie below it. The wheel angle enters through the end heading,
+linearly (a central difference).
 
-Sampled-data margin: the input is held over the period, so h can dip below its linear prediction. The margin is
-1/2 L dt^2, with L the largest |h''| over the period at the corners of the input box (second differences along
-the model).
+Sampled-data margin: h can dip between samples. The margin is 1/2 L dt^2, with L the largest |h''| over the period
+at the corners of the input box (second differences along the model), taken off h at both ends.
 
 QP: identity cost on the inputs scaled by their ranges (tan(delta) over tan of full lock, the pedal). Infeasible:
 the backup's first period (straight, the pedal ramped down). No state projection over the teleop delay: the filter
@@ -164,14 +167,15 @@ class DerivedCBFSafetyFilter:
         t_stop = np.zeros_like(v)
         h = 0.02
         for _ in range(int(60.0 / h)):
-            moving = v > 0.05
-            if not moving.any():
+            # Moving, or still on the throttle, which can start a standing vehicle before the brake ramps in.
+            active = (v > 0.05) | (p > 0.0)
+            if not active.any():
                 break
             p = np.maximum(p - spec.PEDAL_RATE * h, -1.0)
             v_new = np.maximum(v + h * self._rate(p, v, g_along), 0.0)
-            dist += np.where(moving, 0.5 * (v + v_new) * h, 0.0)
-            t_stop += np.where(moving, h, 0.0)
-            v = np.where(moving, v_new, v)
+            dist += np.where(active, 0.5 * (v + v_new) * h, 0.0)
+            t_stop += np.where(active, h, 0.0)
+            v = np.where(active, v_new, v)
         return dist, t_stop
 
     def _gravity(self, vehicle_state, v, p):
@@ -266,7 +270,6 @@ class DerivedCBFSafetyFilter:
             obs.append((float(o[0]), float(o[1]), float(o[2]), vox, voy, hx, hy, speed, vehicle))
 
         g_along = self._gravity(vehicle_state, v, p)
-        a_now = float(self._rate(np.array([p]), np.array([v]), g_along)[0])
 
         # Input box: the steering and pedal rate limits over one period, the soil's cornering authority.
         d_lim = self.max_steer
@@ -279,54 +282,74 @@ class DerivedCBFSafetyFilter:
                                         self._delta + self.steer_step))
         q_lo, q_hi = max(-1.0, p - self.pedal_step), min(1.0, p + self.pedal_step)
 
-        # Stops and barriers at the state and its perturbations (central differences), and along the model
-        # at the corners of the input box (second differences, the sampled-data margin).
-        ev, ep, ex, epsi, et = 0.05, 0.02, 0.05, 0.005, 0.05
-        p_lo_fd, p_hi_fd = max(p - ep, -1.0), min(p + ep, 1.0)
-        corners = [(dl, q) for dl in (d_lo, d_hi) for q in (q_lo, q_hi)]
-        mid, end = [], []
-        for dl, q in corners:
-            for frac, store in ((0.5, mid), (1.0, end)):
-                hstep = frac * self.dt
-                p_c = p + frac * (q - p)
-                v_c = max(v + hstep * a_now, 0.0)
-                psi_c = psi + hstep * v * np.tan(dl) / self.L
-                X_c = X + hstep * v * np.cos(0.5 * (psi + psi_c))
-                Y_c = Y + hstep * v * np.sin(0.5 * (psi + psi_c))
-                store.append((X_c, Y_c, psi_c, v_c, p_c))
-        vs = np.array([v, v + ev, max(v - ev, 0.0), v, v] + [s[3] for s in mid + end])
-        ps = np.array([p, p, p, p_hi_fd, p_lo_fd] + [s[4] for s in mid + end])
-        s_m, t_stop = self._stop(vs, ps, g_along)
-        self._last_stop = float(s_m[0])
+        # The condition is the discrete-time one of a filter whose input is held over its period (Agrawal and
+        # Sreenath 2017): h at the end of the period >= (1 - gamma dt) h now. The end state comes from the model
+        # for the pedal ramped to q at the rate limit and the wheel angle held, for q at the box's ends and at
+        # hold. h is concave in q (it stays flat until the throttle overcomes the soil's resistance, then drops),
+        # so the two secants through those points, as two rows, lie below it. The wheel angle enters through the
+        # end heading, linearly.
+        tan_app = float(np.tan(self._delta))
 
-        def h_at(i, Xq=X, Yq=Y, psiq=psi, dt_obs=0.0):
-            return self._h(np.array(Xq), np.array(Yq), np.array(psiq), s_m[i], t_stop[i], obs, dt_obs)
-        h0 = h_at(0)
-        h_v = (h_at(1) - h_at(2)) / (vs[1] - vs[2])
-        h_p = (h_at(3) - h_at(4)) / max(ps[3] - ps[4], 1e-9)
-        h_X = (h_at(0, Xq=X + ex) - h_at(0, Xq=X - ex)) / (2 * ex)
-        h_Y = (h_at(0, Yq=Y + ex) - h_at(0, Yq=Y - ex)) / (2 * ex)
-        h_psi = (h_at(0, psiq=psi + epsi) - h_at(0, psiq=psi - epsi)) / (2 * epsi)
-        h_t = (h_at(0, dt_obs=et) - h0) / et
+        def mean_rate(q):
+            sub = np.linspace(0.0, 1.0, 5)
+            return float(np.mean(self._rate(p + sub * (q - p), np.full(5, v), g_along)))
+
+        def end_state(q, tan_d=tan_app, frac=1.0):
+            hstep = frac * self.dt
+            v_e = max(v + hstep * (mean_rate(p + frac * (q - p)) + self._d_hat), 0.0)
+            psi_e = psi + hstep * v * tan_d / self.L
+            X_e = X + hstep * 0.5 * (v + v_e) * np.cos(0.5 * (psi + psi_e))
+            Y_e = Y + hstep * 0.5 * (v + v_e) * np.sin(0.5 * (psi + psi_e))
+            return X_e, Y_e, psi_e, v_e, p + frac * (q - p)
+
+        qs = [q_lo, p, q_hi]
+        ends = [end_state(q) for q in qs]
+        ev, epsi = 0.05, 0.005
+        hold = ends[1]
+        # The sampled-data margin: |h''| over the period at the corners of the input box (second differences).
+        corners = [(dl, q) for dl in (d_lo, d_hi) for q in (q_lo, q_hi)]
+        mids = [end_state(q, np.tan(dl), 0.5) for dl, q in corners]
+        cends = [end_state(q, np.tan(dl), 1.0) for dl, q in corners]
+        states = ends + [(hold[0], hold[1], hold[2], hold[3] + ev, hold[4]),
+                         (hold[0], hold[1], hold[2], max(hold[3] - ev, 0.0), hold[4])] + mids + cends
+        vs = np.array([st[3] for st in states])
+        ps = np.array([st[4] for st in states])
+        s_now, t_now = self._stop(np.array([v]), np.array([p]), g_along)
+        s_m, t_stop = self._stop(vs, ps, g_along)
+        self._last_stop = float(s_now[0])
+
+        def h_of(st, i, dt_obs, dpsi=0.0):
+            return self._h(np.array(st[0]), np.array(st[1]), np.array(st[2] + dpsi), s_m[i], t_stop[i], obs, dt_obs)
+        h0 = self._h(np.array(X), np.array(Y), np.array(psi), s_now[0], t_now[0], obs, 0.0)
+        h_end = [h_of(ends[k], k, self.dt) for k in range(3)]
+        h_v = (h_of(states[3], 3, self.dt) - h_of(states[4], 4, self.dt)) / max(vs[3] - vs[4], 1e-9)
+        h_psi = (h_of(hold, 1, self.dt, epsi) - h_of(hold, 1, self.dt, -epsi)) / (2 * epsi)
         L_dd = np.zeros_like(h0)
         n_c = len(corners)
         for k in range(n_c):
-            sm, se = mid[k], end[k]
-            h_m = self._h(np.array(sm[0]), np.array(sm[1]), np.array(sm[2]), s_m[5 + k], t_stop[5 + k], obs,
-                          0.5 * self.dt)
-            h_e = self._h(np.array(se[0]), np.array(se[1]), np.array(se[2]), s_m[5 + n_c + k],
-                          t_stop[5 + n_c + k], obs, self.dt)
+            h_m = h_of(mids[k], 5 + k, 0.5 * self.dt)
+            h_e = h_of(cends[k], 5 + n_c + k, self.dt)
             L_dd = np.maximum(L_dd, np.abs(h_e - 2.0 * h_m + h0) / (0.5 * self.dt) ** 2)
         margin = 0.5 * L_dd * self.dt ** 2
         h = h0 - margin
         self._last_margin = float(margin.max()) if len(margin) else 0.0
 
-        # Rows c_w w + c_q q <= rhs in w = tan(delta), q = the pedal commanded for the end of the period.
+        # Rows c_w w + c_q q <= rhs in w = tan(delta), q = the pedal commanded for the end of the period:
+        # h_end(hold) + slope (q - p) + h_psi dt v (w - tan_app) / L - |h_v| sigma dt - margin >= (1 - gamma dt) h.
         rows = []
+        decay = 1.0 - self.gamma * self.dt
+        c_w = h_psi * self.dt * v / self.L
+        slopes = []
+        if q_hi > p + 1e-9:
+            slopes.append((h_end[2] - h_end[1]) / (q_hi - p))
+        if p > q_lo + 1e-9:
+            slopes.append((h_end[1] - h_end[0]) / (p - q_lo))
+        if not slopes:
+            slopes.append(np.zeros_like(h0))
         for i in range(len(h)):
-            drift = (h_X[i] * v * np.cos(psi) + h_Y[i] * v * np.sin(psi) + h_v[i] * (a_now + self._d_hat)
-                     - abs(h_v[i]) * sigma + h_t[i] - h_p[i] * p / self.dt)
-            rows.append((-h_psi[i] * v / self.L, -h_p[i] / self.dt, self.gamma * h[i] + drift))
+            base = h_end[1][i] - c_w[i] * tan_app - abs(h_v[i]) * sigma * self.dt - margin[i] - decay * h[i]
+            for sl in slopes:
+                rows.append((-c_w[i], -sl[i], base - sl[i] * p))
         min_h = float(h.min()) if len(h) else float("inf")
         self._last_min_h = min_h
 
