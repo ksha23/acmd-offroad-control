@@ -491,6 +491,8 @@ Examples:
     p.add_argument("--terrain-grade", type=float, default=None)
     p.add_argument("--terrain-grade-start-x", type=float, default=None)
     p.add_argument("--safety-sim-clock", action="store_true")
+    p.add_argument("--safety-derived", action="store_true")
+    p.add_argument("--safety-ident", type=str, default=None)
     p.add_argument("--shield-grip-scale", action="store_true",
                    help="Forwarded: filter authority scaled by the adapter's "
                         "measured grip ratio.")
@@ -659,14 +661,14 @@ Examples:
         if args.shield_init_terrain_belief:
             sim_cmd.extend(["--shield-init-terrain-belief", args.shield_init_terrain_belief])
         for flag in ("mpsf_terminal_set", "mpsf_dynamic", "cbf_braking_barrier",
-                     "cbf_theory", "safety_sim_clock"):
+                     "cbf_theory", "safety_sim_clock", "safety_derived"):
             if getattr(args, flag):
                 sim_cmd.append("--" + flag.replace("_", "-"))
         for flag in ("mpsf_time_grid", "mpsf_psf_cost", "mpsf_w_rest", "mpsf_brake_margin",
                      "cbf_brake_margin",
                      "cbf_gamma_brake", "filter_sense_range", "traffic_speed_noise",
                      "filter_grade_preview", "terrain_grade", "terrain_grade_start_x",
-                     "filter_preview_pitch_bias_deg"):
+                     "filter_preview_pitch_bias_deg", "safety_ident"):
             value = getattr(args, flag)
             if value not in (None, ""):
                 sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])

@@ -1105,6 +1105,34 @@ def run_sim_node(args):
                           "brake_margin": float(args.cbf_brake_margin),
                           "gamma_brake": float(args.cbf_gamma_brake),
                           "sense_range": float(args.filter_sense_range)})
+        if getattr(args, "safety_derived", False):
+            # Derived filters (README "Derived parameters"): the plant's powertrain as built, the bounds
+            # identified on separate plant manoeuvres, and the largest obstacle the scenario holds (the
+            # sensing edge must leave room for one just past the range).
+            import json as _json
+            _ident_path = Path(args.safety_ident).expanduser()
+            if not _ident_path.is_absolute():
+                _ident_path = Path(__file__).resolve().parents[2] / _ident_path
+            _ident = _json.loads(_ident_path.read_text())
+            try:
+                _tname = vehicle.GetVehicle().GetTransmission().GetTemplateName()
+            except Exception:  # noqa: BLE001
+                _tname = ""
+            if "Shafts" in _tname or (not _tname and not args.simple_powertrain):
+                _powertrain = "shafts"
+            elif "CVT" in _tname or (not _tname and hasattr(veh, "TransmissionModelType_AUTOMATIC_SIMPLE_CVT")):
+                _powertrain = "simple_cvt"
+            else:
+                _powertrain = "simple_map"
+            _radii = [float(r) for r in get_rock_radii(rocks)] if rocks else []
+            if traffic_mgr is not None and len(traffic_mgr.vehicles):
+                from scenarios.traffic import TRAFFIC_RADIUS as _TR
+                _radii.append(float(_TR))
+            _odd_r = max(_radii) if _radii else 0.0
+            _mpsf_kw.update(derived=True, powertrain=_powertrain, ident=_ident, odd_obstacle_radius=_odd_r,
+                            traffic_speed_err=3.0 * float(args.traffic_speed_noise))
+            print(f"  [SAFETY-DERIVED] powertrain={_powertrain} ({_tname or 'from flags'}) "
+                  f"ident={_ident_path.name} odd_obstacle_radius={_odd_r:.2f}")
         safety_filter = make_safety_filter(
             args.safety_flavor, vehicle_params=vehicle_params,
             nn_model=_nn_cbf,
@@ -2675,6 +2703,13 @@ def main():
                         "(gap - v^2/(2 a_h) on lane obstacles and on the sensing "
                         "edge), with a_h the margined surrogate braking deceleration "
                         "on the believed soil.")
+    p.add_argument("--safety-derived", action="store_true",
+                   help="Filters with no hand-set numbers: --cbf-theory or --mpsf-dynamic with every number "
+                        "from the plant's spec, the rig surrogate, or the bounds in --safety-ident "
+                        "(simulation/safety/README.md, Derived parameters).")
+    p.add_argument("--safety-ident", type=str,
+                   default="simulation/safety/ident/plant_bounds_chrono9.json",
+                   help="--safety-derived: the bounds identified on separate plant manoeuvres.")
     p.add_argument("--cbf-brake-margin", type=float, default=0.85,
                    help="DOB-CBF braking barrier: fraction of the surrogate's peak "
                         "braking deceleration the barrier assumes.")

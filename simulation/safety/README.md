@@ -323,6 +323,75 @@ the steepest admissible downgrade (`unknown_downgrade`, 15%).
 
 Without a preview both filters assume flat ground, as before.
 
+## Derived parameters (`--safety-derived`)
+
+With `--cbf-theory` (`dob_cbf_derived.py`) or `--mpsf-dynamic` (`mpsf.py`,
+derived mode), the filters take no hand-set number. Each one comes from the
+plant's specification, the rig surrogate, or bounds identified on plant
+manoeuvres kept apart from every evaluation scenario. The remaining free
+choices are the design parameters the theory leaves open.
+
+**Specification** (`vehicle_spec.py`, read from the Chrono 9.0.0 HMMWV model)
+
+| Number | Source |
+|---|---|
+| Footprint: three discs, centres -1.74, -0.18, 1.38 m, radius 1.50 m | Three equal strips of the collision mesh's outline (`hmmwv_chassis_col.obj`, 4.67 x 2.56 m), from the chassis centre of mass |
+| Steering 16 per s of full lock, pedal 8 per s, 0.49 rad at full lock | The plant node's actuator limits |
+| 4000 N m per wheel at full brake, tyre radius 0.467 m | HMMWV_BrakeSimple / BrakeShafts, HMMWV_RigidTire |
+| Drive torque at the wheels | The plant's powertrain, quasi-static: `shafts` (engine torque and loss maps, torque converter, gears 0.2/0.4/0.8, up-shift at 2500 rpm of the turbine), `simple_map` (330 N m, 110 kW, six gears) or `simple_cvt`. The simulator reads which one it built. |
+
+**Rig surrogate** (`derived_model.py`). Longitudinal force is drawbar pull =
+tractive effort - motion resistance (Wong, Theory of Ground Vehicles): the
+surrogate's net force at zero slip is the resistance, and a wheel torque adds
+torque / radius until the curve's end (the locked-wheel force braking, the top
+of the drive curve driving). Braking has no margin. The applied pedal is a
+state moved at its rate limit, and acceleration follows from it at once.
+
+**Identified** (`ident/plant_bounds_chrono9.json`, per powertrain, over the three
+soils). From plant manoeuvres shaped like a certificate: a manoeuvre for 1 or
+2 s, then straight full braking to a stop (`benchmarking/safety_ident/`). Half
+the runs, drawn by a fixed seed within each powertrain, soil and manoeuvre
+family, identify. The rest check. Each bound is the tightest of its form that
+covers every identification point (a linear program).
+
+| Bound | Full powertrain | Simple powertrain | Held out |
+|---|---|---|---|
+| MPSF tube, c0 + c1 s + eps S | 0.53 + 0.084 s + 0.030 S | 0.47 + 0.057 s + 0.050 S | full: 0 of 4,574 points outside. Simple: 30 of 4,416, worst by 0.16 m |
+| Backup stop, S_plant <= s0 + s1 S_model | 0.57 + 1.12 S_model | 0.23 + 1.10 S_model | full: 0 of 133 runs. Simple: 1 of 130, by 2 cm |
+| Off the braking line, <= l0 + l1 S_model | 0.27 + 0.040 S_model | 0.33 + 0.028 S_model | full: 3 of 133. Simple: 0 of 130 |
+| Observer error (m/s^2) | 6.7 | 5.0 | full: 1 of 4,637 points above. Simple: 1 of 4,466 |
+
+**Derived from those** (in the filters)
+
+* DOB-CBF barrier: distance from the obstacle's set to the backup's swept
+  footprint, less the radii and the lateral bound, first order in both inputs
+  (module docstring). A vehicle's set is what it can cover during the backup's
+  stop, at its speed plus the measurement error and the soil's drive capability.
+* DOB-CBF sampled-data margin: 1/2 L dt^2 with L the largest |h''| over a
+  period at the corners of the input box.
+* MPSF: no speed cap. The traffic acceleration bound is the soil's drive
+  capability. Each node keeps the clearance widened by the chord and sagitta to
+  the next node (ego and obstacle travel). The check rolls the backup out until
+  the model stops and rejects a plan that does not.
+* Neither filter projects the state over the teleop delay: it runs on the vehicle.
+
+**Free design parameters** (the theory leaves them open, so they are reported
+with a check that the results do not hinge on them): the DOB-CBF's class-K gain
+(3) and observer gain (k dt = 0.5), and the MPSF's horizon (20 x 0.1 s), braking tail (22 x 0.2 s),
+cost weights, solver iterations and OCP margin (0.1 m, which only moves how
+often the exact check rejects a plan). Numerical smoothing: the braking fade at
+a standstill (0.25 m/s) and the low-speed kinematic blend (1.5 to 3 m/s).
+
+**What the identification showed** (journal workspace, `experiments/derived/`).
+The rig surrogate misses the full vehicle's motion resistance by 0.7 to
+0.9 m/s^2 (coasting on clay: 1.25 m/s^2 in the plant, 0.37 at zero slip in the
+surrogate), and its spin-axis moment (which the rig records) puts the
+free-rolling slip at -0.24 on clay where the plant rolls at -0.03. The observer
+error comes from events the model does not have (wheel lock onset, gear shifts
+with their 1 s latency, starts from rest), not from a lag: a first-order lag of
+0 to 0.3 s leaves it at 4 to 7 m/s^2. Bounds for `simple_cvt` (newer Chrono)
+are not identified yet.
+
 ## Tire model supervision
 
 Where either filter queries a learned tire model, that model is supervised only

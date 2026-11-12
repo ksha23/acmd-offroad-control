@@ -66,6 +66,12 @@ def make_safety_filter(flavor: str,
     """
     f = (flavor or '').lower()
     if f in ('dob_cbf', 'cbf', 'legacy', 'dob-cbf'):
+        if flavor_kwargs.pop('derived', False):
+            # The derived DOB-CBF (dob_cbf_derived.py): no hand-set numbers.
+            from .dob_cbf_derived import DerivedCBFSafetyFilter
+            return DerivedCBFSafetyFilter(vehicle_params=vehicle_params,
+                                          nn_casadi=nn_model,
+                                          **flavor_kwargs)
         if flavor_kwargs.pop('theory', False):
             # The textbook DOB-CBF (dob_cbf_theory.py); the published one is
             # the default and stays unchanged for reproduction.

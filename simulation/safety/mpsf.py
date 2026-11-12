@@ -122,6 +122,10 @@ class MPSFSafetyFilter:
                  traffic_speed_err: float = 0.0,
                  traffic_accel: float = 1.0,
                  unknown_downgrade: float = 0.15,
+                 derived: bool = False,
+                 powertrain: str = "shafts",
+                 ident: dict | None = None,
+                 odd_obstacle_radius: float | None = None,
                  build_solver: bool = True,
                  **_ignored):
         self.L = float(vehicle_params.get("Lf", 1.65)) + float(vehicle_params.get("Lr", 1.65))
@@ -315,6 +319,30 @@ class MPSFSafetyFilter:
         self._lat_clamp_count = 0   # executed steering clamped to soil authority
         self._stale_brake_count = 0
         self._solve_ms_ema = 0.0
+        # Derived mode (--safety-derived): every number from the plant's spec, the rig surrogate or the bounds
+        # identified on separate plant manoeuvres (README, "Derived parameters").
+        self.derived = bool(derived)
+        self.powertrain = str(powertrain)
+        if self.derived:
+            from . import vehicle_spec as spec
+            if ident is None:
+                raise ValueError("the derived MPSF needs the identified bounds (--safety-ident)")
+            if not self.dynamic_model:
+                raise ValueError("the derived MPSF is the dynamic one (--mpsf-dynamic)")
+            b = ident["powertrains"][self.powertrain]
+            self.tube_c1 = float(b["tube"]["c1"])
+            self.tube_eps = float(b["tube"]["eps"])
+            self.obstacle_buffer = float(b["tube"]["c0"])
+            self.brake_margin = 1.0
+            self.disc_offsets, self.disc_radius = spec.footprint_discs()
+            self.max_steer = spec.MAX_ROAD_WHEEL
+            self.pedal_rate = spec.PEDAL_RATE
+            self.max_speed = 1.0e3
+            self.kappa_max = float(np.tan(spec.MAX_ROAD_WHEEL)) / self.L
+            if odd_obstacle_radius is not None:
+                self.unseen_obstacle_radius = float(odd_obstacle_radius)
+            # + the stage's length, for the pedal the first input reaches and the gap between nodes
+            self._np += 1
         if self.dynamic_model:
             self._init_dynamic_model()
         if build_solver:
@@ -339,8 +367,14 @@ class MPSFSafetyFilter:
         terrain = _pc.terrain_preset_to_internal(_pc.get_terrain_preset(self.nominal_soil))
         if self._nn is None:
             self._nn = _nn_loader()(self.nn_model_dir, terrain)
-        self._bike = SurrogateBicycle(self._nn, self.vehicle_params, max_steer=self.max_steer)
+        if self.derived:
+            from .derived_model import DerivedBicycle
+            self._bike = DerivedBicycle(self._nn, self.vehicle_params, self.powertrain)
+        else:
+            self._bike = SurrogateBicycle(self._nn, self.vehicle_params, max_steer=self.max_steer)
         self._bike.set_terrain(terrain)
+        if self.derived:
+            self.traffic_accel = self._bike.drive_capability()
         self._dyn_soil = f"nominal:{self.nominal_soil}"
 
     # -- interface parity with CBFSafetyFilter ---------------------------------
@@ -420,6 +454,8 @@ class MPSFSafetyFilter:
             if self.dynamic_model and self._bike is not None:
                 try:
                     self._bike.set_terrain(eval_terrain)
+                    if self.derived:
+                        self.traffic_accel = self._bike.drive_capability()
                     self._dyn_soil = (f"belief:n={float(eval_terrain['n']):.2f},"
                                       f"phi={float(eval_terrain['phi']):.1f}")
                 except Exception as e:  # noqa: BLE001
@@ -534,6 +570,9 @@ class MPSFSafetyFilter:
                          b.llt, b.blend_lo, b.blend_hi, b.tau_kin, b.tau_long, sd.ALPHA_MAX,
                          tuple(sd.KAPPA_BRAKE), tuple(sd.KAPPA_DRIVE), sd.BRAKE_TORQUE_MAX,
                          sd.WHEEL_RADIUS, sd.BRAKE_FADE_SPEED)
+        if self.derived:
+            cfg = cfg + ("derived_v1", self.powertrain, self.pedal_rate, self.kappa_max,
+                         float(np.sum(self._bike.table)), tuple(self._bike.throttles))
         return hashlib.sha1(repr(cfg).encode()).hexdigest()[:12]
 
     def _build_model_dynamic(self):
@@ -561,8 +600,14 @@ class MPSFSafetyFilter:
         terrain = p[q + 4:q + 10]
         curve = p[q + 10:q + 10 + N_CURVE]
         g_along = p[q + 10 + N_CURVE]
-        f_vehicle = self._bike.f_expl_sym(x[0:7], st * self.max_steer, al, terrain, curve,
-                                          p[2] * self.max_accel, self.brake_margin, g_along)
+        if self.derived:
+            # The second input is the pedal rate over its limit. The seventh state is the applied pedal.
+            h_stage = p[q + 11 + N_CURVE]
+            f_vehicle = self._bike.f_expl_sym(x[0:7], st * self.max_steer, al * self.pedal_rate, terrain,
+                                              curve, g_along=g_along)
+        else:
+            f_vehicle = self._bike.f_expl_sym(x[0:7], st * self.max_steer, al, terrain, curve,
+                                              p[2] * self.max_accel, self.brake_margin, g_along)
         eps_r = 0.01  # smooths |r|
         f_expl = ca.vertcat(f_vehicle, uu, ca.sqrt(r ** 2 + eps_r ** 2) - eps_r, uu * turned)
         model = AcadosModel()
@@ -584,6 +629,10 @@ class MPSFSafetyFilter:
                 ax, ay, bx, by, orad = (p[5 + 5 * j + i] for i in range(5))
                 dx, dy = bx - ax, by - ay
                 radius = orad + self.disc_radius + self.obstacle_buffer + self.ocp_margin + tube
+                if self.derived:
+                    # Between nodes: chord and sagitta of the stage (ego travel only, the check is exact).
+                    step = uu * h_stage
+                    radius = ca.sqrt((radius + self.kappa_max * step ** 2 / 8.0) ** 2 + (step / 2.0) ** 2)
                 for off in self.disc_offsets:
                     qx, qy = px + off * hx - ax, py + off * hy - ay
                     w = ca.fmin(ca.fmax((qx * dx + qy * dy) / (dx * dx + dy * dy + 1e-6), 0.0), 1.0)
@@ -601,6 +650,10 @@ class MPSFSafetyFilter:
 
         s_op, a_op = p[0], p[1]
         deviation = self.w_steer * (st - s_op) ** 2 + self.w_alpha * (al - a_op) ** 2
+        if self.derived:
+            # The pedal the input reaches by the end of the stage, against the operator's.
+            deviation = (self.w_steer * (st - s_op) ** 2
+                         + self.w_alpha * (x[6] + al * self.pedal_rate * h_stage - a_op) ** 2)
         progress = self.w_progress * ca.fmax(0.0, 2.0 - uu) ** 2
         model.cost_expr_ext_cost_0 = deviation + progress
         rest = 1.0 if self.psf_cost == "horizon" else self.psf_w_rest
@@ -761,6 +814,10 @@ class MPSFSafetyFilter:
         ocp.constraints.lbx = np.array([v_lo])
         ocp.constraints.ubx = np.array([self.max_speed])
         ocp.constraints.idxbx = np.array([3])
+        if self.derived:
+            ocp.constraints.lbx = np.array([v_lo, -1.0])
+            ocp.constraints.ubx = np.array([self.max_speed, 1.0])
+            ocp.constraints.idxbx = np.array([3, 6])
         ocp.constraints.lbx_e = np.array([v_lo])
         ocp.constraints.ubx_e = np.array([self.max_speed])
         ocp.constraints.idxbx_e = np.array([3])
@@ -1059,6 +1116,11 @@ class MPSFSafetyFilter:
         that obstacle's footprint plus the ego's. No range means no limit."""
         if self.sense_range <= 0.0:
             return 1.0e4
+        if self.derived:
+            # The footprint's front disc, at the planned position, may not reach an obstacle just past the range.
+            margin = (self.unseen_obstacle_radius + max(self.disc_offsets) + self.disc_radius
+                      + self.obstacle_buffer)
+            return max(self.sense_range - margin, 1.0)
         margin = (self.unseen_obstacle_radius + self.vehicle_radius
                   + self.ego_forward_extent + self.obstacle_buffer)
         return max(self.sense_range - margin, 1.0)
@@ -1259,6 +1321,146 @@ class MPSFSafetyFilter:
         # The kept plan is into its braking tail.
         return result(0.0, -1.0, True)
 
+    # -- derived mode (--safety-derived) ---------------------------------------------------------
+    def _node_gap(self, radius, step):
+        """Radius a node must keep so the path to the next node, ``step`` away along an arc of curvature up
+        to the full-lock value, keeps ``radius``: chord half-length and sagitta."""
+        return np.sqrt((radius + self.kappa_max * step ** 2 / 8.0) ** 2 + (0.5 * step) ** 2)
+
+    def _check_derived(self, z0, plan, obstacles, gravity=None):
+        """The check of ``_check`` on the derived model: the plan (steering, pedal rate) and the braking tail,
+        then straight braking with the pedal ramped down until the model stops, which it must. Every node keeps
+        its clearance widened by the gap to the next node, the ego's travel plus the obstacle's."""
+        cmds, hs = self._substep_inputs(plan)
+        a_min = max(self._bike.peak_decel(), 0.5)
+        if gravity is not None:
+            a_min = max(a_min - G * unknown_sine(self.unknown_downgrade), 0.3)
+        t_tail = float(z0[3]) / a_min + 2.0 / self.pedal_rate + 5.0
+        xs = self._bike.rollout_rk4(z0, cmds, hs, self.cert_dt, t_tail=t_tail, gravity=gravity)
+        if xs[-1, 3] > 0.05:
+            return False
+        n_extra = len(xs) - 1 - len(hs)
+        t = np.concatenate([np.cumsum(hs), hs.sum() + self.cert_dt * np.arange(1, n_extra + 1)])
+        P, psi = xs[:, :2], xs[:, 2]
+        seg = np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1]))
+        turned = np.cumsum(np.abs(np.diff(np.unwrap(psi))))
+        tube = self.tube_c1 * np.cumsum(seg) + self.tube_eps * np.cumsum(seg * turned)
+        P, psi = P[1:], psi[1:]
+        # Travel to the next node (the last node's own step for the last one).
+        step = np.append(seg[1:], seg[-1]) if len(seg) > 1 else seg
+        cx, cy, r_eff, _ = self._last_sense
+        if np.any(np.hypot(P[:, 0] - cx, P[:, 1] - cy) + tube + step > r_eff):
+            return False
+        for o in obstacles or ():
+            radius = float(o[2]) + self.disc_radius + self.obstacle_buffer
+            ax, ay, bx, by = self._segment(o, t)
+            far = np.hypot(np.diff(bx, append=bx[-1]), np.diff(by, append=by[-1]))
+            need = self._node_gap(radius + tube, step + far)
+            dx, dy = bx - ax, by - ay
+            for off in self.disc_offsets:
+                qx = P[:, 0] + off * np.cos(psi) - ax
+                qy = P[:, 1] + off * np.sin(psi) - ay
+                w = np.clip((qx * dx + qy * dy) / (dx * dx + dy * dy + 1e-6), 0.0, 1.0)
+                if np.any(np.hypot(qx - w * dx, qy - w * dy) < need):
+                    return False
+        return True
+
+    def _filter_derived(self, vehicle_state, s_op, a_op, obstacles, x_sense, y_sense, result):
+        """``_filter_dynamic`` on the derived model. The plan's inputs are (steering, pedal rate over its limit),
+        the model's pedal starts at the applied one, and the executed command is the pedal the first input
+        reaches at the end of the period."""
+        from .surrogate_dynamics import N_CURVE  # noqa: F401
+        p0 = float(self._alpha_applied)
+        h0 = self.time_steps[0]
+        z0 = np.array([float(vehicle_state["x"]), float(vehicle_state["y"]), float(vehicle_state["psi"]),
+                       max(float(vehicle_state.get("u", 0.0)), 0.0), float(vehicle_state.get("v", 0.0)),
+                       float(vehicle_state.get("omega", 0.0)), p0])
+        r_eff = self._sensed_radius()
+        a_term = max(self._bike.peak_decel(), 0.5)
+        self._last_sense = (x_sense, y_sense, r_eff, a_term)
+
+        def pedal_after(rate):
+            return float(np.clip(p0 + rate * self.pedal_rate * h0, -1.0, 1.0))
+
+        a_reach = float(np.clip(a_op, p0 - self.pedal_rate * h0, p0 + self.pedal_rate * h0))
+
+        obs = self._select_obstacles(z0[0], z0[1], z0[2], obstacles)
+        full = {(float(o[0]), float(o[1])): o for o in obstacles or ()}
+        obs = [full.get((o[0], o[1]), o) for o in obs]
+        while len(obs) < self.n_obs:
+            obs.append((z0[0] + 1e4, z0[1] + 1e4, 0.1))
+        tail = ([x_sense, y_sense, r_eff, a_term] + list(self._bike.terrain_vec) + list(self._bike.curve))
+        steps = self._psf_steps()
+        n_total = len(steps)
+        t_nodes = np.concatenate([[0.0], np.cumsum(steps)])
+        segs = [np.stack(self._segment(o, t_nodes), axis=1) for o in obs]
+        gravity = gravity_lookup(vehicle_state, self._bike.L, self.unknown_downgrade)
+        if self._sol is not None:
+            guess = list(self._sol[1:]) + [self._sol[-1]]
+        else:
+            first = float(np.clip((a_op - p0) / (self.pedal_rate * h0), -1.0, 1.0))
+            guess = [(s_op, first)] + [(s_op, 0.0)] * (self.N - 1)
+        cmds, hs = self._substep_inputs(guess)
+        xs = self._bike.rollout_rk4(z0, cmds, hs, self.cert_dt, t_tail=0.0, gravity=gravity)
+        P = xs[:, :2]
+        seg = np.concatenate([[0.0], np.hypot(np.diff(P[:, 0]), np.diff(P[:, 1]))])
+        turned = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(np.unwrap(xs[:, 2]))))])
+        xw = [np.concatenate([xs[i], [np.cumsum(seg)[i], turned[i], np.cumsum(seg * turned)[i]]])
+              for i in range(0, len(xs), self.psf_rk_steps)]
+
+        def stage_p(k):
+            o_k = [c for o, sg in zip(obs, segs) for c in (*sg[k], float(o[2]))]
+            head = [s_op, a_op] if k < self.N else [0.0, -1.0]
+            g_k = gravity(float(xw[k][0]), float(xw[k][1])) if gravity is not None else 0.0
+            h_k = steps[k] if k < n_total else steps[-1]
+            return np.array(head + [1.0, self._brake_grip, self._lat_accel_max] + o_k + tail + [g_k, h_k],
+                            dtype=float)
+        brake = np.array([0.0, -1.0])
+        plan = None
+        sv = self._solver
+        try:
+            x_init = np.concatenate([z0, [0.0, 0.0, 0.0]])
+            sv.set(0, "lbx", x_init)
+            sv.set(0, "ubx", x_init)
+            for k in range(n_total + 1):
+                sv.set(k, "p", stage_p(k))
+                sv.set(k, "x", xw[k])
+            for k in range(n_total):
+                if k < self.N:
+                    sv.set(k, "u", np.array(guess[k], dtype=float))
+                else:
+                    # The tail's pedal ramps past -1 (the model clips it), so its bound is lifted there.
+                    sv.set(k, "u", brake)
+                    sv.constraints_set(k, "lbu", brake)
+                    sv.constraints_set(k, "ubu", brake)
+                    if k > 0:
+                        sv.constraints_set(k, "lbx", np.array([-0.5, -1.0e3]))
+            status = sv.solve()
+            if status in (0, 2):
+                plan = [tuple(float(v) for v in np.clip(sv.get(k, "u"), -1.0, 1.0)) for k in range(self.N)]
+        except Exception:  # noqa: BLE001
+            plan = None
+
+        self._sol = plan
+        if plan is not None and self._check_derived(z0, plan, obstacles, gravity):
+            self._verified_count += 1
+            self._backup = list(plan[1:])
+            s_c, rate = plan[0]
+            p_c = pedal_after(rate)
+            tol = self.psf_change_tol
+            modified = abs(s_c - s_op) > tol or abs(p_c - a_reach) > tol
+            return result(s_c, p_c, modified)
+        if plan is None:
+            self._solve_fail_count += 1
+        if self._backup is None:
+            self._fail_stop_count += 1
+            return result(0.0, -1.0, True)
+        self._backup_count += 1
+        if self._backup:
+            s_c, rate = self._backup.pop(0)
+            return result(s_c, pedal_after(rate), True)
+        return result(0.0, -1.0, True)
+
     def filter(self, desired_steering, desired_throttle, desired_brake,
                vehicle_state, obstacles, **_):
         t0 = time.time()
@@ -1282,7 +1484,7 @@ class MPSFSafetyFilter:
             # Where the plant's rate-limited pedal will be at the next call.
             step = self.pedal_rate * self.time_steps[0]
             self._alpha_applied += float(np.clip(a_c - self._alpha_applied, -step, step))
-            if self.dynamic_model:
+            if self.dynamic_model and not self.derived:
                 # The model's applied acceleration, one period later.
                 target = self._bike.settled_accel(a_c, self._accel_grip * self.max_accel,
                                                   self.brake_margin)
@@ -1314,6 +1516,8 @@ class MPSFSafetyFilter:
         # delay advance below, because that is where the obstacles were sensed.
         x_sense, y_sense = x, y
 
+        if self.derived:
+            return self._filter_derived(vehicle_state, s_op, a_op, obstacles, x_sense, y_sense, _result)
         if self.dynamic_model:
             return self._filter_dynamic(vehicle_state, s_op, a_op, obstacles,
                                         x_sense, y_sense, _result)
