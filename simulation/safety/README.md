@@ -304,6 +304,25 @@ cutting in are all inside the set, so the kept plan stays safe while they move.
 adds a Gaussian error of standard deviation s to each vehicle's speed as both
 filters receive it, and sets `traffic_speed_err` to 3 s.
 
+## Grade preview (`--filter-grade-preview`)
+
+For the terrain-preview study (`lidar_terrain/DESIGN.md` in the journal
+workspace). `grade_preview.py` reads what the simulator puts in the vehicle
+state: `grade_now`, the sine of the chassis's nose-down pitch, or
+`terrain_ahead`, ground heights every 0.5 m along the heading to 40 m (from SCM
+`GetHeight`, or as a roof lidar 2.1 m up sees them, with ground behind a crest
+unknown). A downgrade is measured over one wheelbase, and unknown ground takes
+the steepest admissible downgrade (`unknown_downgrade`, 15%).
+
+* Textbook DOB-CBF: the braking-distance and sensing-edge barriers stop with
+  `a_h cos(theta) - g sin(theta)`, theta the steepest downgrade between the
+  vehicle and its stopping point (a fixed point over the stop's length).
+* Dynamic MPSF: the surrogate model carries gravity along the heading. The OCP
+  takes it at each node's warm-start position, and the check that certifies a
+  plan takes it at every position the plan reaches.
+
+Without a preview both filters assume flat ground, as before.
+
 ## Tire model supervision
 
 Where either filter queries a learned tire model, that model is supervised only
