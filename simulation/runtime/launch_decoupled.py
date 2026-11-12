@@ -492,6 +492,7 @@ Examples:
     p.add_argument("--terrain-grade-start-x", type=float, default=None)
     p.add_argument("--safety-sim-clock", action="store_true")
     p.add_argument("--safety-derived", action="store_true")
+    p.add_argument("--mpsf-max-iter", type=int, default=None)
     p.add_argument("--safety-ident", type=str, default=None)
     p.add_argument("--shield-grip-scale", action="store_true",
                    help="Forwarded: filter authority scaled by the adapter's "
@@ -668,7 +669,7 @@ Examples:
                      "cbf_brake_margin",
                      "cbf_gamma_brake", "filter_sense_range", "traffic_speed_noise",
                      "filter_grade_preview", "terrain_grade", "terrain_grade_start_x",
-                     "filter_preview_pitch_bias_deg", "safety_ident"):
+                     "filter_preview_pitch_bias_deg", "safety_ident", "mpsf_max_iter"):
             value = getattr(args, flag)
             if value not in (None, ""):
                 sim_cmd.extend(["--" + flag.replace("_", "-"), str(value)])

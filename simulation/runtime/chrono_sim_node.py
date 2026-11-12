@@ -1097,6 +1097,7 @@ def run_sim_node(args):
                      # deviations of the speed measurement's error.
                      "traffic_speed_err": 3.0 * float(args.traffic_speed_noise),
                      "w_rest": float(args.mpsf_w_rest),
+                     "psf_max_iter": int(args.mpsf_max_iter),
                      "brake_margin": float(args.mpsf_brake_margin),
                      "time_steps": _parse_time_grid(args.mpsf_time_grid)}
                     if args.safety_flavor in ("mpsf", "predictive", "mpc_safety")
@@ -2677,6 +2678,9 @@ def main():
                    help="MPSF only: horizon time grid as comma-separated DTxN "
                         "groups, e.g. 0.1x10,0.3x10 for 4 s in 20 steps. The first "
                         "step should equal the 0.1 s filter period. Default 0.1x20.")
+    p.add_argument("--mpsf-max-iter", type=int, default=20,
+                   help="--mpsf-dynamic: SQP iterations per call (a free design parameter: the check "
+                        "keeps safety, fewer iterations mean more steps on the kept plan).")
     p.add_argument("--mpsf-w-rest", type=float, default=0.01,
                    help="MPSF terminal set only: deviation weight on inputs after "
                         "the first, relative to the first.")
